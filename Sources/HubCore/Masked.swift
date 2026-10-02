@@ -1,0 +1,128 @@
+import Foundation
+
+public enum Masked {
+    public static func denyTokens(project: String) -> [String] {
+        var tokens: [String] = []
+        let generic = Set(["users", "dev", "home", "private", "tmp", "var", "src", "code", "projects", "documents", "library", "application", "support", "application support", "agenthub", "worktrees", "folders", "volumes"])
+        
+        let url = URL(fileURLWithPath: project)
+        let pathComponents = url.pathComponents
+        for component in pathComponents {
+            let lower = component.lowercased()
+            if lower == "/" || lower.isEmpty { continue }
+            if !generic.contains(lower) {
+                tokens.append(lower)
+                tokens += lower.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init).filter { !generic.contains($0) }
+            }
+        }
+        
+        if !url.lastPathComponent.isEmpty && url.lastPathComponent != "/" {
+            tokens.append(url.lastPathComponent.lowercased())
+        }
+        
+        let branchResult = Proc.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd: project)
+        if branchResult.passed {
+            let branch = branchResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !branch.isEmpty && branch != "HEAD" {
+                tokens.append(branch.lowercased())
+            }
+        }
+        
+        tokens.append(NSUserName().lowercased())
+        
+        let emailResult = Proc.run(["git", "config", "user.email"], cwd: project)
+        if emailResult.passed {
+            let email = emailResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !email.isEmpty {
+                tokens.append(email.lowercased())
+            }
+        }
+        
+        let nameResult = Proc.run(["git", "config", "user.name"], cwd: project)
+        if nameResult.passed {
+            let name = nameResult.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !name.isEmpty {
+                for part in name.split(separator: " ") {
+                    tokens.append(String(part).lowercased())
+                }
+                tokens.append(name.lowercased())
+            }
+        }
+        
+        return Array(Set(tokens.filter { $0.count >= 4 })).sorted()
+    }
+    
+    public static func scan(dir: URL, tokens: [String]) -> [String] {
+        var problems: [String] = []
+        guard let enumerator = FileManager.default.enumerator(at: dir, includingPropertiesForKeys: [.isRegularFileKey]) else { return [] }
+        for case let fileURL as URL in enumerator {
+            let name = fileURL.lastPathComponent
+            if name == "map.json" || name == "check.json" { continue }
+            guard let isRegular = try? fileURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile, isRegular else { continue }
+            guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
+            
+            let patterns = ["/Users/", "/home/", "/Volumes/", "/private/", "~/"]
+            for pattern in patterns {
+                if content.contains(pattern) {
+                    problems.append("\(fileURL.lastPathComponent): contains \(pattern)")
+                }
+            }
+            
+            if content.range(of: #"[A-Z0-9a-z._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"#, options: .regularExpression) != nil {
+                problems.append("\(fileURL.lastPathComponent): contains an email address")
+            }
+            
+            if Secrets.contains(content) {
+                problems.append("\(fileURL.lastPathComponent): contains Secrets-style key patterns")
+            }
+            
+            let lowerContent = content.lowercased()
+            for token in tokens {
+                if lowerContent.contains(token) {
+                    problems.append("\(fileURL.lastPathComponent): contains token \(token)")
+                }
+            }
+        }
+        return problems
+    }
+
+    public static func maskPrompt(job: Job, runDir: String, maskDir: String) -> String {
+        """
+        MASK step for an external worker that must never learn anything about this project.
+        Project (read only, never modify it): \(runDir)
+        Objective: \(job.objective)
+        Allowed files (relative to the project): \(job.allowedFiles.joined(separator: ", "))
+        Real acceptance argv: \(job.checkArgv.joined(separator: " "))
+
+        Write into \(maskDir):
+        - brief.md: a self-contained generic task describing exactly the work to do, where every project name, product, person, company, path, URL, email, key and domain identifier is replaced by neutral placeholders (P1, P2...). Include the expected behaviour precisely enough to implement it without the project.
+        - files/<flat basename>: masked copies of only the files the worker needs to read or edit (same placeholders). No subfolders.
+        - map.json: {"placeholders":{"P1":"original"},"files":{"basename":"real relative path"}}
+        - check.json: a JSON argv array run inside files/ that verifies the generic work without the project (for example ["sh","check.sh"] with check.sh in files/, or ["python3","test_x.py"]). It must not need network or anything outside files/.
+        Do not copy secrets, credentials or personal data. Do not edit the project.
+        """
+    }
+
+    public static func heavyPrompt(brief: String, files: [String]) -> String {
+        """
+        \(brief)
+
+        Files in the current directory you may read and edit: \(files.joined(separator: ", ")).
+        Edit only those files. You cannot run shell commands; a check runs after you finish.
+        """
+    }
+
+    public static func decodePrompt(job: Job, runDir: String, maskDir: String) -> String {
+        """
+        DECODE step. An external worker solved a masked copy of this task.
+        Objective: \(job.objective)
+        Masked files before the worker: \(maskDir)/masked-original/
+        Masked files after the worker: \(maskDir)/files/
+        Placeholder and file map: \(maskDir)/map.json
+        Apply the worker's changes to the real files in \(runDir), reversing the placeholders, and fix anything that does not fit the real project.
+        Edit only these files: \(job.allowedFiles.joined(separator: ", ")).
+        Then run the acceptance argv and make it pass: \(job.checkArgv.joined(separator: " "))
+        Do not commit.
+        """
+    }
+}

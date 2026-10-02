@@ -26,7 +26,7 @@ public struct CLIArgs {
 
     public init(_ arguments: [String]) throws {
         subcommand = arguments.first ?? "help"
-        let values: Set<String> = ["main", "size", "kind", "privacy", "project", "objective", "allowed-file", "check", "harness", "session", "message", "from", "file", "to"]
+        let values: Set<String> = ["main", "size", "kind", "privacy", "project", "objective", "allowed-file", "check", "harness", "session", "message", "from", "file", "to", "offload"]
         let switches: Set<String> = ["json", "wait", "dry-run", "worktree", "all", "statusline", "force", "no-launch"]
         var i = 1
         while i < arguments.count {
@@ -74,9 +74,18 @@ public struct CLIArgs {
         }
         let project = URL(fileURLWithPath: try a.required("project")).standardizedFileURL.path
         guard let files = a.flags["allowed-file"], !files.isEmpty else { throw invalid("Missing --allowed-file") }
-        return Job(id: JobStore.newId(now: now), project: project, objective: try a.required("objective"),
+        var job = Job(id: JobStore.newId(now: now), project: project, objective: try a.required("objective"),
                    allowedFiles: files, checkArgv: check, size: size, kind: kind, privacy: privacy,
                    isolation: a.has("worktree") ? .worktree : .checkout,
                    mainModel: try a.required("main"), created: now)
+        if let offload = a.value("offload") {
+            switch offload {
+            case "auto": job.offload = nil
+            case "always": job.offload = true
+            case "never": job.offload = false
+            default: throw invalid("Invalid --offload (auto|always|never)")
+            }
+        }
+        return job
     }
 }

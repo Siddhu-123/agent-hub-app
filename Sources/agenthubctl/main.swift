@@ -125,17 +125,27 @@ func run() throws -> Int32 {
     case "delegate":
         let job = try CLIArgs.jobFromDelegateArgs(a, now: now)
         if a.has("dry-run") {
-            if let worker = PolicyEngine.pickWorker(snapshot(), job.size, job.kind, job.privacy, mainModel: job.mainModel) {
-                print("\(worker.id) \(worker.harness)")
+            if let plan = PolicyEngine.plan(snapshot(), job) {
+                if let broker = plan.broker {
+                    print("\(plan.worker.id) \(plan.worker.harness) (broker: \(broker.id))")
+                } else {
+                    print("\(plan.worker.id) \(plan.worker.harness)")
+                }
             } else { print("none: no eligible worker has capacity for this job") }
             return 0
         }
         let queued = try store.enqueue(job, now: now)
         if a.has("wait") || !appIsRunning(paths, now: now) {
-            guard let worker = PolicyEngine.pickWorker(snapshot(), queued.size, queued.kind, queued.privacy, mainModel: queued.mainModel) else {
-                try printJSON(jsonObject(queued)); return 3
+            var final = queued
+            // A masked offload that is skipped comes back queued with offload off; run it once more on a trusted worker.
+            for _ in 0..<2 {
+                guard let plan = PolicyEngine.plan(snapshot(), final) else { break }
+                var q = final
+                q.broker = plan.broker?.id
+                final = Runner(paths: paths, config: config).start(q, worker: plan.worker, now: Date())
+                if final.state != .queued { break }
             }
-            let final = Runner(paths: paths, config: config).start(queued, worker: worker, now: now)
+            if final.state == .queued { try printJSON(jsonObject(final)); return 3 }
             try printJSON(jsonObject(final))
             switch final.state {
             case .verified: return 0
