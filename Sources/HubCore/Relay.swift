@@ -20,10 +20,12 @@ public struct Relay: Sendable {
         self.paths = paths
         self.config = config
         self.ctlPath = ctlPath
-        self.push = push ?? { Proc.run($0).passed }
+        // The test gate sets AGENT_HUB_TEST so default side effects never open terminals, message sessions or signal real PIDs.
+        let live = ProcessInfo.processInfo.environment["AGENT_HUB_TEST"] == nil
+        self.push = push ?? { live && Proc.run($0).passed }
         let termApp = config.terminalApp
-        self.openScript = openScript ?? { url in Proc.run(["open", "-a", termApp, url.path]).passed }
-        self.interrupt = interrupt ?? { pid in kill(pid, SIGINT) }
+        self.openScript = openScript ?? { url in live && Proc.run(["open", "-a", termApp, url.path]).passed }
+        self.interrupt = interrupt ?? { pid in if live { kill(pid, SIGINT) } }
         self.usageProvider = usageProvider
         self.recentJobs = recentJobs
     }
