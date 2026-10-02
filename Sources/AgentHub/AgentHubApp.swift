@@ -11,6 +11,7 @@ struct AgentHubApp: App {
         let siblingPath = Bundle.main.executableURL?.deletingLastPathComponent().appendingPathComponent("agenthubctl")
         let ctlPath = FileManager.default.fileExists(atPath: bundlePath.path) ? bundlePath.path : (siblingPath?.path ?? "/usr/local/bin/agenthubctl")
         let e = Engine(ctlPath: ctlPath)
+        e.onLog = { Notifier.shared.post($0) }
         _engine = StateObject(wrappedValue: e)
         e.start()
         
@@ -23,12 +24,6 @@ struct AgentHubApp: App {
         Window("Agent Hub", id: "main") {
             MainWindow()
                 .environmentObject(engine)
-                .onChange(of: engine.log) { old, new in
-                    if new.count > old.count {
-                        let diff = new.suffix(new.count - old.count)
-                        Notifier.shared.post(diff)
-                    }
-                }
         }
         
         MenuBarExtra("Agent Hub", systemImage: "circle.hexagongrid") {

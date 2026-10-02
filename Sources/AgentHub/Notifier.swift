@@ -4,7 +4,7 @@ import UserNotifications
 class Notifier {
     static let shared = Notifier()
     
-    func post(_ lines: ArraySlice<String>) {
+    func post(_ lines: [String]) {
         guard Bundle.main.bundleIdentifier != nil else { return }
         
         for line in lines {
