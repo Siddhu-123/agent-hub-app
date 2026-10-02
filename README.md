@@ -110,21 +110,15 @@ Agent Hub calculates remaining quota `L` (from `0.0` to `1.0`) across all rate-l
 
 ### Policy Bands Table
 
-| Band | Condition | Main Session Cap | Worker Jobs Cap | Description |
-|:---|:---|:---:|:---:|:---|
-| **`healthy`** | `L > sameHarnessMinLeft` (or unmetered) | `maxMainSessions` (default 4) | `maxJobs` (default 4) | Full capacity for concurrent main sessions and worker delegation. |
-| **`reduced`** | `sameHarnessMinLeft ≥ L > singleSessionBelow` | `maxMainSessions` (default 4) | 1 (if `L ≥ workerMinLeft`, else 0) | Quota running low. Disallows same-harness worker delegation to preserve quota for the main session. |
-| **`single`** | `singleSessionBelow ≥ L > wrapUpBelow` | 1 | 0 | Tight quota. Only one main session allowed on this harness; no worker jobs. |
-| **`wrapUp`** | `wrapUpBelow ≥ L > exhaustedAtOrBelow` | 0 | 0 | Quota critically low. Requests main session to finish current step, write a handoff file, and migrate to another harness. |
-| **`exhausted`** | `L ≤ exhaustedAtOrBelow` (or cooling down) | 0 | 0 | Quota exhausted. Watchdog triggers automatic handoff to keep work moving on an alternative frontier model. |
+| Band | `L` (fraction left) | Main sessions on this harness | Workers on this harness |
+|:---|:---|:---:|:---:|
+| **`healthy`** | `≥ sameHarnessMinLeft` (0.40), or unknown | `maxMainSessions` (2) | allowed (shared `maxJobs` = 4) |
+| **`reduced`** | `0.30 – 0.40` | `maxMainSessions` | 1 (if `L ≥ workerMinLeft` 0.15); never for its own main model |
+| **`single`** | `0.15 – 0.30` | 1 (extra sessions move to the next main model on another harness) | none |
+| **`wrapUp`** | `0.02 – 0.15` | 0 — the session is asked to finish its step and write a handoff | none |
+| **`exhausted`** | `≤ 0.02`, or cooling after a limit error | 0 — automatic handoff to the next main model | none |
 
-### Default Thresholds
-- `exhaustedAtOrBelow = 0.05` (5%)
-- `wrapUpBelow = 0.15` (15%)
-- `singleSessionBelow = 0.30` (30%)
-- `sameHarnessMinLeft = 0.50` (50%)
-- `workerMinLeft = 0.20` (20%)
-- Strictly ordered: `0 ≤ exhaustedAtOrBelow < wrapUpBelow ≤ singleSessionBelow ≤ sameHarnessMinLeft ≤ 1`.
+Main models are tried in `mainOrder` (intelligence hierarchy, e.g. Claude Opus ↔ GPT Sol). All thresholds, caps and the order are editable in **Settings** and **Models**; changes apply on the next 30-second tick.
 
 ---
 
@@ -134,7 +128,7 @@ When a new frontier model is available, you can add it as a primary conversation
 
 ### In the UI
 1. Navigate to the **Models** section in the Agent Hub sidebar.
-2. Click **Add main model**.
+2. Click **Add Main Model...**.
 3. Enter model details:
    - **ID**: `gemini-4-pro`
    - **Harness**: `antigravity`
@@ -165,7 +159,17 @@ This adds the model, sets `isMain = true`, and appends it to `mainOrder`. The po
 - **Privacy Classes**:
   - `project`: For proprietary project code. Work is restricted exclusively to trusted harnesses (`harness.trusted = true`). Untrusted harnesses (like local/third-party OpenCode endpoints) are blocked.
   - `generic`: For general algorithmic tasks and non-sensitive logic. Untrusted harnesses may be selected, and absolute file paths are omitted from prompts.
+- **Untrusted harnesses** (`trusted = false`, e.g. OpenCode free models) only receive `generic` jobs. Generic objectives may not contain private paths or emails. The worker runs under `sandbox-exec` in a throwaway `/private/tmp` stage that holds copies of the allowed files only; it cannot read `/Users`, `/Volumes` or temp folders, and only the allowed files are copied back. If the macOS sandbox is unavailable, untrusted jobs fail instead of running unsandboxed.
 - **Worker Scoping**:
-  - Worker jobs are restricted to explicit `allowedFiles` (1–24 relative paths). Modifying any file outside this list causes verification failure.
-  - Jobs run in isolated git worktrees (`.agenthub-worktrees/<id>`) guarded by file locks (`flock`) to prevent checkout conflicts.
-  - Acceptance checks (`checkArgv`) run hermetically without shell execution before results are marked verified.
+  - Worker jobs are restricted to explicit `allowedFiles` (1–24 relative paths). Changing any other file sends the job to **needs review**.
+  - One job edits a project checkout at a time (`flock`). Jobs created with isolation `worktree` run in `~/Library/Application Support/AgentHub/worktrees/<id>` when the checkout is busy; verified worktree jobs are merged from the **Jobs** view.
+  - The acceptance command (`checkArgv`) runs without a shell; a job is **verified** only when it passes and every change is inside `allowedFiles`.
+
+---
+
+## Notes
+
+- **Claude usage** comes from the status line hook (Settings → **Install status line**). Without it Claude shows "Usage unknown" and is treated as healthy.
+- **Codex hooks** must be approved once inside Codex after installing (Codex trusts hooks by hash).
+- If the older Python `agent-hub` hooks are also installed, both sets run; uninstall one to avoid duplicate messages.
+- Data lives in `~/Library/Application Support/AgentHub` (`AGENT_HUB_HOME` overrides it).
