@@ -380,7 +380,7 @@ public final class Runner: @unchecked Sendable {
         self.lock.unlock()
         
         if checkRes.exitCode != 0 || checkRes.timedOut {
-            return fallbackMasked(job: j, reason: "masked check failed: \(String(checkRes.output.suffix(800)))", store: store)
+            return fallbackMasked(job: j, reason: "masked check failed: \(String(checkRes.output.suffix(800)))\nworker output: \(String(workerRes.output.suffix(1500)))", store: store)
         }
         
         // DECODE

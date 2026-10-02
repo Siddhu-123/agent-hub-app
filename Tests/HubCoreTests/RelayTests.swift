@@ -166,7 +166,7 @@ final class Box<T: Sendable>: @unchecked Sendable {
             let scriptText = try String(contentsOf: scriptUrl, encoding: .utf8)
             #expect(scriptText.contains("cd '"))
             #expect(scriptText.contains("proj'\"'\"' with spaces'"))
-            #expect(scriptText.contains("exec 'codex' '-C' '")) // and so on
+            #expect(scriptText.contains("exec '") && scriptText.contains("codex' '-C' '")) // bare or resolved executable
             #expect(scriptText.contains("\"$(cat ")) // prompt is double quoted
             
             // Should pass zsh -n

@@ -63,8 +63,17 @@ public enum Proc {
             let candidate = "\(dir)/\(expanded)"
             if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
         }
+        // Some CLIs ship only inside an app bundle.
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        for app in ["/Applications", "\(home)/Applications"] {
+            for inner in bundled[expanded] ?? [] where FileManager.default.isExecutableFile(atPath: app + inner) { return app + inner }
+        }
         return nil
     }
+
+    static let bundled: [String: [String]] = [
+        "codex": ["/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex", "/Codex.app/Contents/Resources/codex"],
+    ]
 
     public static func searchPath(_ current: String?) -> String {
         let home = FileManager.default.homeDirectoryForCurrentUser.path
