@@ -22,6 +22,12 @@ public struct HubPaths: Sendable {
     public var locks: URL { root.appendingPathComponent("locks") }
     /// Isolated git worktrees for jobs whose checkout is busy (kept outside user projects).
     public var worktrees: URL { root.appendingPathComponent("worktrees") }
+    /// Live feed of every harness session, read by the app and by Notch (sessions/, requests/, responses/, platforms/, hub.json, notch.json).
+    public var live: URL { root.appendingPathComponent("live") }
+
+    /// Bundle identifiers of the console app and of Notch, which shows the feed.
+    public static let appBundleID = "dev.agenthub.AgentHub"
+    public static let notchBundleID = "sidco.notch"
 
     /// The process env marker that tells hooks a session was started by the hub as a worker (not a main session).
     public static let workerEnv = "AGENT_HUB_WORKER"
