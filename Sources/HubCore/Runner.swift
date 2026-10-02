@@ -1,0 +1,310 @@
+import Foundation
+import CryptoKit
+
+public final class Runner: @unchecked Sendable {
+    public let paths: HubPaths
+    private var _config: AppConfig
+    /// Replaceable while jobs run (the Engine updates it after a settings change).
+    public var config: AppConfig {
+        get { lock.lock(); defer { lock.unlock() }; return _config }
+        set { lock.lock(); _config = newValue; lock.unlock() }
+    }
+    
+    public typealias Exec = ([String], String?, [String: String]?, String?, TimeInterval, @escaping (Int32) -> Void) -> CheckResult
+    public var exec: Exec
+    
+    private let lock = NSLock()
+    private var pids: [String: Int32] = [:]
+    
+    public init(paths: HubPaths, config: AppConfig) {
+        self.paths = paths
+        self._config = config
+        self.exec = { Proc.run($0, cwd: $1, env: $2, stdin: $3, timeout: $4, onStart: $5) }
+    }
+    
+    public func start(_ job: Job, worker: ModelEntry, now: Date) -> Job {
+        let config = self.config
+        let store = JobStore(paths: paths)
+        var j = job
+        guard let harness = config.harness(worker.harness) else { return j }
+        
+        let stdProject = URL(fileURLWithPath: j.project).standardized.path
+        let projectData = Data(stdProject.utf8)
+        let sha256 = SHA256.hash(data: projectData).map { String(format: "%02x", $0) }.joined()
+        let lockName = sha256
+        
+        try? FileManager.default.createDirectory(at: paths.locks, withIntermediateDirectories: true)
+        let lockPath = paths.locks.appendingPathComponent("\(lockName).lock").path
+        let fd = open(lockPath, O_CREAT | O_RDWR, 0o600)
+        var lockHeld = false
+        if fd >= 0 {
+            if flock(fd, LOCK_EX | LOCK_NB) == 0 {
+                lockHeld = true
+            }
+        }
+        defer {
+            if lockHeld { flock(fd, LOCK_UN) }
+            if fd >= 0 { close(fd) }
+        }
+        
+        var runDir = j.project
+        if !lockHeld {
+            if j.isolation == .worktree {
+                runDir = paths.worktrees.appendingPathComponent(j.id).path
+                try? FileManager.default.createDirectory(at: paths.worktrees, withIntermediateDirectories: true)
+                let res = Proc.run(["git", "-C", j.project, "worktree", "add", runDir, "-b", "agenthub/\(j.id)"])
+                if !res.passed {
+                    j.state = .failed
+                    j.note = "Worktree creation failed: \(res.output)"
+                    try? store.save(j)
+                    return j
+                }
+                j.worktree = runDir
+                j.branch = "agenthub/\(j.id)"
+            } else {
+                return j // Still queued
+            }
+        }
+        
+        j.state = .running
+        j.harness = worker.harness
+        j.model = worker.id
+        j.started = now
+        try? store.save(j)
+        
+        let candidates = harness.accounts.isEmpty ? [harness.executable] : harness.accounts
+        
+        var lastOutput = ""
+        var workerExited = false
+        var latestCooling = now.addingTimeInterval(1800)
+        let before = snapshot(runDir)
+        let baseHead = head(runDir)
+        
+        let role = j.kind.rawValue
+        var prompt = "Role: \(role)\nObjective: \(j.objective)\nAllowed files: \(j.allowedFiles.joined(separator: ", "))\nPrivacy class: \(j.privacy.rawValue)\nAcceptance argv: \(j.checkArgv.joined(separator: " "))\nRules: only edit allowed files, do not spawn workers, do not read credentials, run the acceptance argv before finishing."
+        if j.privacy == .generic {
+            prompt = "Role: \(role)\nObjective: \(j.objective)\nAllowed files: \(j.allowedFiles.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", "))\nPrivacy class: \(j.privacy.rawValue)\nAcceptance argv: \(j.checkArgv.joined(separator: " "))\nRules: only edit allowed files, do not spawn workers, do not read credentials, run the acceptance argv before finishing."
+        }
+        
+        for candidate in candidates {
+            if !harness.accounts.isEmpty {
+                if let _ = Cooldowns.until(account: candidate, paths: paths, now: now) { continue }
+            } else {
+                if let _ = Cooldowns.until(model: worker.id, paths: paths, now: now) { continue }
+            }
+            
+            var env = ProcessInfo.processInfo.environment
+            env[HubPaths.workerEnv] = "1"
+            
+            let stdin = harness.promptViaStdin ? prompt : nil
+            let pStr = harness.promptViaStdin ? "-" : prompt
+            let values = [
+                "exe": candidate,
+                "model": worker.id,
+                "effort": worker.effort ?? "high",
+                "project": runDir,
+                "prompt": pStr
+            ]
+            let argv = Proc.fill(harness.workerArgs, values)
+            
+            if store.get(j.id)?.state == .cancelled {
+                return store.get(j.id) ?? j
+            }
+            
+            let res = exec(argv, runDir, env, stdin, config.limits.jobTimeoutSeconds) { pid in
+                self.lock.lock()
+                self.pids[j.id] = pid
+                self.lock.unlock()
+            }
+            
+            self.lock.lock()
+            self.pids.removeValue(forKey: j.id)
+            self.lock.unlock()
+            
+            if store.get(j.id)?.state == .cancelled {
+                return store.get(j.id) ?? j
+            }
+            
+            lastOutput = res.output
+            if let seconds = Cooldowns.fromOutput(res.output, now: now) {
+                let coolingUntil = now.addingTimeInterval(seconds)
+                latestCooling = coolingUntil
+                if !harness.accounts.isEmpty {
+                    Cooldowns.set("account:\(candidate)", until: coolingUntil, paths: paths)
+                } else {
+                    Cooldowns.set("model:\(worker.id)", until: coolingUntil, paths: paths)
+                }
+                j.attempts.append(JobAttempt(harness: harness.id, model: worker.id, account: candidate, result: "quota", coolingUntil: coolingUntil))
+                
+                if j.attempts.count >= 3 {
+                    j.state = .failed
+                    j.output = formatOutput(lastOutput, harness: harness)
+                    try? store.save(j)
+                    return j
+                }
+                continue // Try next candidate
+            } else {
+                workerExited = true
+                if res.exitCode != 0 || res.timedOut {
+                    j.output = formatOutput(lastOutput, harness: harness) + "\nExit code: \(res.exitCode)"
+                } else {
+                    j.output = formatOutput(lastOutput, harness: harness)
+                }
+                break // No quota error, stop trying candidates
+            }
+        }
+        
+        if !workerExited {
+            // All exhausted
+            Cooldowns.set("harness:\(harness.id)", until: latestCooling, paths: paths)
+            j.state = .queued
+            j.harness = nil
+            j.model = nil
+            try? store.save(j)
+            return j
+        }
+        
+        j.gate = runGate(job: j, runDir: runDir, before: before, baseHead: baseHead)
+        
+        if let g = j.gate {
+            if j.kind == .implement {
+                j.state = g.passed ? .verified : .needsReview
+            } else {
+                j.state = (g.acceptance.passed && g.outsideAllowed.isEmpty) ? .verified : .needsReview
+            }
+        }
+        
+        j.finished = now
+        try? store.save(j)
+        return j
+    }
+    
+    private func snapshot(_ runDir: String) -> [String: String] {
+        getHashes(status: Proc.run(["git", "status", "--porcelain=v1", "-uall", "-z"], cwd: runDir).output, runDir: runDir)
+    }
+
+    /// Changes are measured between the snapshot taken before the worker and one taken right after it,
+    /// so files produced by the acceptance command itself are not attributed to the worker.
+    private func head(_ runDir: String) -> String? {
+        let r = Proc.run(["git", "rev-parse", "HEAD"], cwd: runDir)
+        return r.passed ? r.output.trimmingCharacters(in: .whitespacesAndNewlines) : nil
+    }
+
+    private func runGate(job: Job, runDir: String, before preHashes: [String: String], baseHead: String?) -> GateResult? {
+        let postHashes = snapshot(runDir)
+        var changed = Set<String>()
+        // Workers in a worktree may commit their work; committed files count as changed too.
+        if let baseHead, let postHead = head(runDir), postHead != baseHead {
+            let diff = Proc.run(["git", "diff", "--name-only", "-z", baseHead, postHead], cwd: runDir).output
+            changed.formUnion(diff.split(separator: "\0").map(String.init).filter { !$0.isEmpty })
+        }
+        let acceptance = Proc.run(job.checkArgv, cwd: runDir, timeout: 600)
+
+        for f in Set(preHashes.keys).union(postHashes.keys) where preHashes[f] != postHashes[f] {
+            changed.insert(f)
+        }
+        let changedFiles = changed.sorted()
+        
+        var outsideAllowed: [String] = []
+        for f in changedFiles {
+            var matched = false
+            for pattern in job.allowedFiles {
+                if fnmatch(pattern, f, 0) == 0 {
+                    matched = true
+                    break
+                }
+            }
+            if !matched { outsideAllowed.append(f) }
+        }
+        
+        return GateResult(acceptance: acceptance, changedFiles: changedFiles, outsideAllowed: outsideAllowed)
+    }
+    
+    private func getHashes(status: String, runDir: String) -> [String: String] {
+        var hashes: [String: String] = [:]
+        let parts = status.components(separatedBy: "\0")
+        var i = 0
+        while i < parts.count {
+            let part = parts[i]
+            if part.isEmpty {
+                i += 1
+                continue
+            }
+            if part.count >= 4 {
+                let state = String(part.prefix(2))
+                let file = String(part.dropFirst(3))
+                
+                var contentHash = "deleted"
+                let url = URL(fileURLWithPath: runDir).appendingPathComponent(file)
+                if let data = try? Data(contentsOf: url) {
+                    contentHash = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                }
+                hashes[file] = "\(state)|\(contentHash)"
+                // Renames and copies carry the original path as the next NUL-separated field.
+                if state.hasPrefix("R") || state.hasPrefix("C") { i += 1 }
+            }
+            i += 1
+        }
+        return hashes
+    }
+    
+    private func formatOutput(_ output: String, harness: Harness) -> String {
+        if harness.id == "codex" {
+            let lines = output.components(separatedBy: "\n")
+            for line in lines.reversed() {
+                if line.contains("\"item.completed\"") && line.contains("\"agent_message\"") {
+                    if let data = line.data(using: .utf8),
+                       let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let type = obj["type"] as? String, type == "item.completed",
+                       let item = obj["item"] as? [String: Any],
+                       let itemType = item["type"] as? String, itemType == "agent_message",
+                       let text = item["text"] as? String {
+                        return String(text.prefix(4000))
+                    }
+                }
+            }
+        }
+        if harness.id == "claude" {
+            if let data = output.data(using: .utf8),
+               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let res = obj["result"] as? String {
+                return String(res.prefix(4000))
+            }
+        }
+        return String(output.suffix(4000))
+    }
+    
+    public func cancel(_ id: String) {
+        lock.lock()
+        let pid = pids[id]
+        lock.unlock()
+        
+        let store = JobStore(paths: paths)
+        if var j = store.get(id) {
+            j.state = .cancelled
+            try? store.save(j)
+        }
+        
+        guard let pid = pid else { return }
+        
+        kill(pid, SIGTERM)
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2.0) {
+            kill(pid, SIGKILL)
+        }
+    }
+    
+    public func mergeWorktree(_ job: Job) throws {
+        guard job.state == .verified else {
+            throw HubError.invalid("Job is not verified")
+        }
+        guard let runDir = job.worktree, let branch = job.branch else {
+            throw HubError.invalid("Job has no worktree")
+        }
+        let res = Proc.run(["git", "-C", job.project, "merge", "--no-ff", branch, "-m", "Merge agent-hub job \(job.id)"])
+        if !res.passed {
+            throw HubError.invalid("Merge failed: \(res.output)")
+        }
+        _ = Proc.run(["git", "-C", job.project, "worktree", "remove", "--force", runDir])
+        _ = Proc.run(["git", "-C", job.project, "branch", "-d", branch])
+    }
+}
