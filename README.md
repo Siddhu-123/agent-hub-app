@@ -157,9 +157,15 @@ This adds the model, sets `isMain = true`, and appends it to `mainOrder`. The po
 
 - **Secret Scrubbing**: All prompts, objectives, file paths, and handoff contents pass through `Secrets.assertClean` before being sent to any model or stored.
 - **Privacy Classes**:
-  - `project`: For proprietary project code. Work is restricted exclusively to trusted harnesses (`harness.trusted = true`). Untrusted harnesses (like local/third-party OpenCode endpoints) are blocked.
+  - `project`: For proprietary project code. Only trusted harnesses (`harness.trusted = true`) ever read the project. Untrusted harnesses take part only through the masked pipeline below.
   - `generic`: For general algorithmic tasks and non-sensitive logic. Untrusted harnesses may be selected, and absolute file paths are omitted from prompts.
 - **Untrusted harnesses** (`trusted = false`, e.g. OpenCode free models) only receive `generic` jobs. Generic objectives may not contain private paths or emails. The worker runs under `sandbox-exec` in a throwaway `/private/tmp` stage that holds copies of the allowed files only; it cannot read `/Users`, `/Volumes` or temp folders, and only the allowed files are copied back. If the macOS sandbox is unavailable, untrusted jobs fail instead of running unsandboxed.
+- **Masked pipeline** (heavy project work on free models): project `implement` jobs whose size is in `limits.maskedOffloadSizes` (default `hard`), or any job delegated with `--offload always`, run in three steps:
+  1. **Mask**: a trusted tier-3 broker (a trusted worker with intelligence `brokerMinIntelligence`–`brokerMaxIntelligence`, default 55–79, preferring a harness other than the main model's) reads the project and writes a generic `brief.md`, masked copies of the needed files, a local placeholder `map.json` and a self-contained `check.json` into a private `/private/tmp` folder.
+  2. **Scan**: the app fails closed if the brief or files contain a private path, an email, a key pattern, any original value from the map, the project or folder names, the git branch, or the user's name or email.
+  3. **Heavy**: the free worker sees only the brief and the masked files, in the sandbox, without shell access; the masked check then runs in the same sandbox.
+  4. **Decode**: the broker applies the result to the real allowed files, reversing the placeholders, and the normal gate runs.
+  Any failure in mask, scan, or the masked check requeues the job with offload off, so a trusted worker does it instead. `--offload never` keeps a job off the pipeline.
 - **Worker Scoping**:
   - Worker jobs are restricted to explicit `allowedFiles` (1–24 relative paths). Changing any other file sends the job to **needs review**.
   - One job edits a project checkout at a time (`flock`). Jobs created with isolation `worktree` run in `~/Library/Application Support/AgentHub/worktrees/<id>` when the checkout is busy; verified worktree jobs are merged from the **Jobs** view.

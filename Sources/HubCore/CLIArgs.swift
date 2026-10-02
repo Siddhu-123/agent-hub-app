@@ -14,7 +14,7 @@ public struct CLIArgs {
       delegate --main MODEL --project DIR --objective TEXT --allowed-file FILE ...
                --check '["command","arg"]' [--size tiny|routine|hard]
                [--kind implement|review|plan] [--privacy project|generic]
-               [--worktree] [--wait] [--dry-run]
+               [--worktree] [--wait] [--dry-run] [--offload auto|always|never]
       send --harness HARNESS --session ID --message TEXT [--kind message|task|wrap_up]
       handoff --from HARNESS --project DIR --file FILE [--session ID] [--to MODEL] [--no-launch]
       sessions [--all]

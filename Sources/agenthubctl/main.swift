@@ -48,7 +48,7 @@ func run() throws -> Int32 {
     let a = try CLIArgs(Array(CommandLine.arguments.dropFirst()))
     let allowed: [String: Set<String>] = [
         "help": [], "hook": [], "statusline": [], "status": ["json"],
-        "delegate": ["main", "size", "kind", "privacy", "project", "objective", "allowed-file", "check", "worktree", "wait", "dry-run"],
+        "delegate": ["main", "size", "kind", "privacy", "project", "objective", "allowed-file", "check", "worktree", "wait", "dry-run", "offload"],
         "send": ["harness", "session", "message", "kind"],
         "handoff": ["from", "project", "file", "session", "to", "no-launch"],
         "sessions": ["all"], "tick": [], "install-hooks": ["statusline", "force"], "uninstall-hooks": []
