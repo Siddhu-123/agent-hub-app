@@ -54,6 +54,14 @@ struct SandboxTests {
         let edit = perm["edit"] as! [String: Any]
         #expect(perm["bash"] as? String == "ask")
         #expect(edit["c.swift"] as? String == "allow")
+        // OpenCode's last matching rule wins, so the "*" fallback must come before every per-file allow in the raw JSON.
+        for section in ["\"read\":{", "\"edit\":{"] {
+            let body = configStr.components(separatedBy: section)[1]
+            #expect(body.hasPrefix("\"*\":\"ask\""))
+        }
+        job.allowedFiles = ["!x.swift"]
+        #expect(throws: HubError.self) { try Sandbox.prepare(job: job, runDir: runDir.path, baseEnv: [:]) }
+        job.allowedFiles = ["a/b/c.swift", "d.swift"]
         
         // reject duplicate basenames
         job.allowedFiles = ["a/x.swift", "b/x.swift"]

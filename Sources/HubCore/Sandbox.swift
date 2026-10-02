@@ -32,6 +32,10 @@ public enum Sandbox {
             if basename.contains("*") || basename.contains("?") || basename.contains("[") {
                 throw HubError.invalid("allowedFiles cannot contain glob patterns")
             }
+            // Rules are emitted with sorted keys so the "*" fallback comes first; a name sorting before it would be overridden.
+            if let c = basename.unicodeScalars.first, c.value <= 0x2A {
+                throw HubError.invalid("allowedFiles basenames cannot start with \(c)")
+            }
             if names.keys.contains(basename) {
                 throw HubError.invalid("allowedFiles basenames must be unique")
             }
@@ -119,7 +123,8 @@ public enum Sandbox {
             "mcp": [String: Any]()
         ]
         
-        let data = try JSONSerialization.data(withJSONObject: configContent, options: [])
+        // OpenCode applies rules in order and the last match wins, so "*" must precede the per-file allows; it sorts first.
+        let data = try JSONSerialization.data(withJSONObject: configContent, options: [.sortedKeys])
         let configContentStr = String(data: data, encoding: .utf8) ?? ""
         env["OPENCODE_CONFIG_CONTENT"] = configContentStr
         
