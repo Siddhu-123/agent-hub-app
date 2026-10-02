@@ -86,7 +86,8 @@ public enum Sandbox {
         env["OPENCODE_DISABLE_CLAUDE_CODE"] = "1"
         env["OPENCODE_DISABLE_EXTERNAL_SKILLS"] = "1"
         
-        var p: [String: String] = ["*": "deny"]
+        // "ask" rather than "deny": denied tools are dropped from the request, which the free tier rejects. Headless runs auto-reject asks.
+        var p: [String: String] = ["*": "ask"]
         for basename in names.keys {
             p["\(dir.path)/\(basename)"] = "allow"
             p[basename] = "allow"
@@ -94,16 +95,16 @@ public enum Sandbox {
         
         let configContent: [String: Any] = [
             "permission": [
-                "*": "deny",
+                "*": "ask",
                 "read": p,
                 "edit": p,
-                "bash": "deny",
-                "external_directory": "deny",
-                "task": "deny",
-                "skill": "deny",
-                "lsp": "deny",
-                "webfetch": "deny",
-                "websearch": "deny"
+                "bash": "ask",
+                "external_directory": "ask",
+                "task": "ask",
+                "skill": "ask",
+                "lsp": "ask",
+                "webfetch": "ask",
+                "websearch": "ask"
             ],
             "share": "disabled",
             "autoupdate": false,

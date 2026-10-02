@@ -79,8 +79,43 @@ public struct Limits: Codable, Equatable, Sendable {
     public var minIntelligence: [String: Int] = ["tiny": 0, "routine": 55, "hard": 75, "review": 80, "plan": 80]
     /// Send SIGINT to the old session's process after an automatic handoff.
     public var interruptOnAutoHandoff = true
+    /// Project jobs of these sizes go to a free untrusted worker through the masked pipeline:
+    /// a trusted tier-3 broker masks the task, the free worker runs on the masked stage only, the broker decodes the result.
+    public var maskedOffloadSizes: [String] = ["hard"]
+    /// Tier 3: trusted worker models in this intelligence range may act as the mask/decode broker.
+    public var brokerMinIntelligence = 55
+    public var brokerMaxIntelligence = 79
 
     public init() {}
+
+    private enum CodingKeys: String, CodingKey {
+        case maxMainSessions, maxJobs, sameHarnessMinLeft, singleSessionBelow, wrapUpBelow, exhaustedAtOrBelow, workerMinLeft
+        case graceSeconds, activeSeconds, maxStopBlocks, jobTimeoutSeconds, minIntelligence, interruptOnAutoHandoff
+        case maskedOffloadSizes, brokerMinIntelligence, brokerMaxIntelligence
+    }
+
+    /// Keys missing from an older config keep their defaults instead of failing the whole file.
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        func v<T: Decodable>(_ key: CodingKeys, _ fallback: T) throws -> T { try c.decodeIfPresent(T.self, forKey: key) ?? fallback }
+        let d = Limits()
+        maxMainSessions = try v(.maxMainSessions, d.maxMainSessions)
+        maxJobs = try v(.maxJobs, d.maxJobs)
+        sameHarnessMinLeft = try v(.sameHarnessMinLeft, d.sameHarnessMinLeft)
+        singleSessionBelow = try v(.singleSessionBelow, d.singleSessionBelow)
+        wrapUpBelow = try v(.wrapUpBelow, d.wrapUpBelow)
+        exhaustedAtOrBelow = try v(.exhaustedAtOrBelow, d.exhaustedAtOrBelow)
+        workerMinLeft = try v(.workerMinLeft, d.workerMinLeft)
+        graceSeconds = try v(.graceSeconds, d.graceSeconds)
+        activeSeconds = try v(.activeSeconds, d.activeSeconds)
+        maxStopBlocks = try v(.maxStopBlocks, d.maxStopBlocks)
+        jobTimeoutSeconds = try v(.jobTimeoutSeconds, d.jobTimeoutSeconds)
+        minIntelligence = try v(.minIntelligence, d.minIntelligence)
+        interruptOnAutoHandoff = try v(.interruptOnAutoHandoff, d.interruptOnAutoHandoff)
+        maskedOffloadSizes = try v(.maskedOffloadSizes, d.maskedOffloadSizes)
+        brokerMinIntelligence = try v(.brokerMinIntelligence, d.brokerMinIntelligence)
+        brokerMaxIntelligence = try v(.brokerMaxIntelligence, d.brokerMaxIntelligence)
+    }
 }
 
 public struct AppConfig: Codable, Equatable, Sendable {
@@ -242,6 +277,10 @@ public struct Job: Codable, Equatable, Identifiable, Sendable {
     public var worktree: String?
     public var branch: String?
     public var note: String?
+    /// nil: policy decides; true: always use the masked pipeline for a project job; false: never offload.
+    public var offload: Bool?
+    /// Trusted tier-3 model that masks and decodes a masked-pipeline job (set when the job is scheduled).
+    public var broker: String?
 
     public init(id: String = UUID().uuidString.lowercased(), project: String, objective: String, allowedFiles: [String],
                 checkArgv: [String], size: JobSize, kind: JobKind, privacy: Privacy, isolation: Isolation = .checkout,

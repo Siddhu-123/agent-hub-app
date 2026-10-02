@@ -52,7 +52,7 @@ struct SandboxTests {
         let configDict = try JSONSerialization.jsonObject(with: configData, options: []) as! [String: Any]
         let perm = configDict["permission"] as! [String: Any]
         let edit = perm["edit"] as! [String: Any]
-        #expect(perm["bash"] as? String == "deny")
+        #expect(perm["bash"] as? String == "ask")
         #expect(edit["c.swift"] as? String == "allow")
         
         // reject duplicate basenames
