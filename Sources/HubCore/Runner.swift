@@ -30,6 +30,21 @@ public final class Runner: @unchecked Sendable {
         if let current = store.get(j.id), current.state != .queued { return current }
         guard let harness = config.harness(worker.harness) else { return j }
         
+        if !harness.trusted {
+            if j.privacy != .generic {
+                j.state = .failed
+                j.note = "untrusted harness only runs generic jobs"
+                try? store.save(j)
+                return j
+            }
+            if !Sandbox.available() {
+                j.state = .failed
+                j.note = "macOS sandbox unavailable for untrusted harness"
+                try? store.save(j)
+                return j
+            }
+        }
+        
         let stdProject = URL(fileURLWithPath: j.project).standardized.path
         let projectData = Data(stdProject.utf8)
         let sha256 = SHA256.hash(data: projectData).map { String(format: "%02x", $0) }.joined()
@@ -74,6 +89,19 @@ public final class Runner: @unchecked Sendable {
         j.started = now
         try? store.save(j)
         
+        var stage: Sandbox.Stage?
+        if !harness.trusted {
+            do {
+                stage = try Sandbox.prepare(job: j, runDir: runDir, baseEnv: ProcessInfo.processInfo.environment)
+            } catch {
+                j.state = .failed
+                j.note = "Sandbox prepare failed: \(error)"
+                try? store.save(j)
+                return j
+            }
+        }
+        defer { if let stage { Sandbox.cleanup(stage) } }
+
         let candidates = harness.accounts.isEmpty ? [harness.executable] : harness.accounts
         
         var lastOutput = ""
@@ -95,7 +123,7 @@ public final class Runner: @unchecked Sendable {
                 if let _ = Cooldowns.until(model: worker.id, paths: paths, now: now) { continue }
             }
             
-            var env = ProcessInfo.processInfo.environment
+            var env = stage?.env ?? ProcessInfo.processInfo.environment
             env[HubPaths.workerEnv] = "1"
             
             let stdin = harness.promptViaStdin ? prompt : nil
@@ -104,16 +132,17 @@ public final class Runner: @unchecked Sendable {
                 "exe": candidate,
                 "model": worker.id,
                 "effort": worker.effort ?? "high",
-                "project": runDir,
+                "project": stage?.dir.path ?? runDir,
                 "prompt": pStr
             ]
-            let argv = Proc.fill(harness.workerArgs, values)
+            var argv = Proc.fill(harness.workerArgs, values)
+            if !harness.trusted { argv = Sandbox.wrap(argv) }
             
             if store.get(j.id)?.state == .cancelled {
                 return store.get(j.id) ?? j
             }
             
-            let res = exec(argv, runDir, env, stdin, config.limits.jobTimeoutSeconds) { pid in
+            let res = exec(argv, stage?.dir.path ?? runDir, env, stdin, config.limits.jobTimeoutSeconds) { pid in
                 self.lock.lock()
                 self.pids[j.id] = pid
                 self.lock.unlock()
@@ -164,6 +193,12 @@ public final class Runner: @unchecked Sendable {
             j.model = nil
             try? store.save(j)
             return j
+        }
+        
+        if let stage {
+            do {
+                _ = try Sandbox.collect(stage, into: runDir)
+            } catch { }
         }
         
         j.gate = runGate(job: j, runDir: runDir, before: before, baseHead: baseHead)

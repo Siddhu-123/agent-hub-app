@@ -42,6 +42,19 @@ public struct JobStore: Sendable {
     @discardableResult
     public func enqueue(_ job: Job, now: Date = Date()) throws -> Job {
         var j = job
+
+        if j.privacy == .generic {
+            let o = j.objective
+            if o.contains("/Users/") || o.contains("/home/") || o.contains("/private/") || o.contains("/Volumes/") || o.contains("~/") {
+                throw HubError.invalid("generic jobs must not contain private paths or emails")
+            }
+            let emailRegex = try! NSRegularExpression(pattern: "[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}")
+            let range = NSRange(location: 0, length: o.utf16.count)
+            if emailRegex.firstMatch(in: o, options: [], range: range) != nil {
+                throw HubError.invalid("generic jobs must not contain private paths or emails")
+            }
+        }
+
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: j.project, isDirectory: &isDir), isDir.boolValue else {
             throw HubError.invalid("project must be an existing directory")
