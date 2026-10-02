@@ -26,6 +26,8 @@ public final class Runner: @unchecked Sendable {
         let config = self.config
         let store = JobStore(paths: paths)
         var j = job
+        // Another process (the app or `agenthubctl delegate --wait`) may have claimed the job already.
+        if let current = store.get(j.id), current.state != .queued { return current }
         guard let harness = config.harness(worker.harness) else { return j }
         
         let stdProject = URL(fileURLWithPath: j.project).standardized.path
