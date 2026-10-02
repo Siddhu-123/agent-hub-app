@@ -8,7 +8,7 @@ public struct CLIArgs {
 
     public static let usage = """
     Usage: agenthubctl <command> [options]
-      hook <harness> <event>
+      hook <claude|codex|antigravity|opencode> <event>
       statusline
       status [--json]
       monitor [--follow] [--json]

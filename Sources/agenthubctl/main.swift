@@ -137,13 +137,27 @@ func run() throws -> Int32 {
     }
     switch a.subcommand {
     case "hook":
-        let data = FileHandle.standardInput.readDataToEndOfFile()
-        guard var payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any], !payload.isEmpty else { return 0 }
-        if let pid = agentPID() { payload["agent_pid"] = Int(pid) }
-        if let result = relay.hook(a.positionals[0], event: a.positionals[1], payload: payload,
-                                   env: ProcessInfo.processInfo.environment, now: now) {
-            try printJSON(result)
+        let platform = a.positionals[0], event = a.positionals[1]
+        guard ["claude", "codex", "antigravity", "opencode"].contains(platform) else { return 0 }
+        let env = ProcessInfo.processInfo.environment
+        let feed = LiveFeed(paths: paths)
+        if env["AGENT_HUB_TEST"] == nil && env[HubPaths.workerEnv] == nil && feed.shouldLaunchHub() {
+            _ = Proc.run(["/usr/bin/open", "-g", "-b", HubPaths.appBundleID], timeout: 5)
         }
+        let data = FileHandle.standardInput.readDataToEndOfFile()
+        guard var payload = try? JSONSerialization.jsonObject(with: data) as? [String: Any], !payload.isEmpty else {
+            if platform == "antigravity" { print("{}") }
+            return 0
+        }
+        let pid = agentPID()
+        if let pid { payload["agent_pid"] = Int(pid) }
+        var relayOutput: [String: Any]?
+        if ["claude", "codex"].contains(platform), ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"].contains(event) {
+            relayOutput = relay.hook(platform, event: event, payload: payload, env: env, now: now)
+        }
+        if let output = feed.handle(platform: platform, event: event, payload: payload, env: env, pid: pid, now: now) ?? relayOutput {
+            try printJSON(output)
+        } else if platform == "antigravity" { print("{}") }
     case "monitor": monitor(paths: paths, follow: a.has("follow"), json: a.has("json"))
     case "stats":
         let stats = Activity.stats(Activity.read(paths: paths, limit: Int.max))
@@ -243,7 +257,10 @@ func run() throws -> Int32 {
 
 do { exit(try run()) }
 catch {
-    if CommandLine.arguments.dropFirst().first == "hook" { exit(0) }
+    if CommandLine.arguments.dropFirst().first == "hook" {
+        if CommandLine.arguments.dropFirst(2).first == "antigravity" { print("{}") }
+        exit(0)
+    }
     FileHandle.standardError.write(Data((error.localizedDescription + "\n").utf8))
     exit(2)
 }

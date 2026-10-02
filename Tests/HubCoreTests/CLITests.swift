@@ -79,3 +79,32 @@ struct CLITests {
         }
     }
 }
+
+extension CLITests {
+    @Test func hooksRouteAllPlatformsAndInvalidInput() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let executable = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/debug/agenthubctl").path
+        #expect(FileManager.default.isExecutableFile(atPath: executable))
+        func hook(_ platform: String, _ event: String, _ input: String) -> CheckResult {
+            Proc.run([executable, "hook", platform, event], env: ["AGENT_HUB_HOME": root.path, "AGENT_HUB_TEST": "1", "PATH": "/usr/bin:/bin"], stdin: input, timeout: 5)
+        }
+        for platform in ["claude", "codex", "antigravity", "opencode"] {
+            for input in ["", "garbage", "{}", "[]"] {
+                let r = hook(platform, "SessionStart", input)
+                #expect(r.passed)
+                #expect(r.output.trimmingCharacters(in: .whitespacesAndNewlines) == (platform == "antigravity" ? "{}" : ""))
+            }
+        }
+        #expect(hook("claude", "SessionStart", "{\"session_id\":\"c\"}").passed)
+        #expect(hook("codex", "SessionStart", "{\"session_id\":\"d\"}").passed)
+        #expect(hook("antigravity", "PreInvocation", "{\"conversationId\":\"a\"}").output.trimmingCharacters(in: .whitespacesAndNewlines) == "{}")
+        let r = hook("opencode", "permission", "{\"sessionID\":\"o\",\"id\":\"p\"}")
+        let output = try #require(JSONSerialization.jsonObject(with: Data(r.output.utf8)) as? [String: Any])
+        #expect(output["requestId"] is String)
+        #expect(hook("unknown", "SessionStart", "{\"session_id\":\"x\"}").output.isEmpty)
+        let feed = LiveFeed(paths: HubPaths(root: root))
+        #expect(Set(feed.sessions().map(\.platform)) == Set(["claude", "codex", "antigravity", "opencode"]))
+    }
+}

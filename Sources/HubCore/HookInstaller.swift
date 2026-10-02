@@ -1,77 +1,92 @@
 import Foundation
 
-/// Installs and uninstalls Agent Hub lifecycle hooks and status line into Claude Code and Codex configs.
+/// Installs and uninstalls Agent Hub hooks for all four harnesses.
 public struct HookInstaller: Sendable {
     public var claudeSettings: URL
     public var codexHooks: URL
+    public var geminiDirs: [URL]
+    public var opencodeConfigDir: URL
+    public var livePath: URL
     public var ctlPath: String
 
     public init(
         claudeSettings: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".claude/settings.json"),
         codexHooks: URL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/hooks.json"),
-        ctlPath: String
+        ctlPath: String,
+        geminiDirs: [URL]? = nil,
+        opencodeConfigDir: URL? = nil,
+        livePath: URL = HubPaths().live
     ) {
         self.claudeSettings = claudeSettings
         self.codexHooks = codexHooks
         self.ctlPath = ctlPath
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        self.geminiDirs = geminiDirs ?? ["antigravity", "antigravity-cli", "antigravity-ide"].map { home.appendingPathComponent(".gemini/" + $0) }
+        self.opencodeConfigDir = opencodeConfigDir ?? home.appendingPathComponent(".config/opencode")
+        self.livePath = livePath
     }
 
-    /// Adds one hook group per event to each file: SessionStart, UserPromptSubmit, PostToolUse (Claude matcher "*"), Stop and SessionEnd.
-    /// The command is '<ctlPath>' hook <harnessId> <Event>, with timeout 10.
-    /// Before the first change it backs each file up as <file>.bak-agenthub.
-    /// Idempotent: groups whose command contains agenthubctl are replaced, never duplicated.
-    /// All other keys and hook groups are preserved byte-for-byte as JSON values.
+    /// Replaces our hooks and retired bridges while preserving unrelated configuration.
+    /// Existing configuration files are backed up once before migration.
     @discardableResult
     public func install() throws -> [String] {
-        let events = ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"]
-
-        // 1. Claude settings
-        try backupIfNeeded(claudeSettings)
-        var claudeRoot = (try readJSON(from: claudeSettings)) ?? [:]
-        var claudeHooks = (claudeRoot["hooks"] as? [String: Any]) ?? [:]
-        for event in events {
-            let commandStr = "\(Proc.quote(ctlPath)) hook claude \(event)"
-            let hookItem: [String: Any] = [
-                "type": "command",
-                "command": commandStr,
-                "timeout": 10
-            ]
-            var group: [String: Any] = [
-                "hooks": [hookItem]
-            ]
-            if event == "PostToolUse" {
-                group["matcher"] = "*"
+        var messages: [String] = []
+        for (harness, file) in [("claude", claudeSettings), ("codex", codexHooks)] {
+            try backupIfNeeded(file)
+            var root = try readJSON(from: file) ?? [:]
+            var hooks = root["hooks"] as? [String: Any] ?? [:]
+            for key in Array(hooks.keys) {
+                if let groups = hooks[key] as? [Any] { hooks[key] = groups.filter { !isRetiredGroup($0) } }
             }
-            let existingGroups = (claudeHooks[event] as? [Any]) ?? []
-            claudeHooks[event] = updateHookGroups(existing: existingGroups, replacement: group)
+            for event in events(harness) {
+                let item: [String: Any] = ["type": "command", "command": "\(Proc.quote(ctlPath)) hook \(harness) \(event)", "timeout": event == "PermissionRequest" ? 600 : 10]
+                var group: [String: Any] = ["hooks": [item]]
+                if ["PreToolUse", "PostToolUse", "PermissionRequest"].contains(event) { group["matcher"] = "*" }
+                hooks[event] = updateHookGroups(existing: hooks[event] as? [Any] ?? [], replacement: group)
+            }
+            root["hooks"] = hooks
+            try writeJSON(root, to: file)
+            messages.append("Installed hooks into \(file.path)")
         }
-        claudeRoot["hooks"] = claudeHooks
-        try writeJSON(claudeRoot, to: claudeSettings)
-
-        // 2. Codex hooks
-        try backupIfNeeded(codexHooks)
-        var codexRoot = (try readJSON(from: codexHooks)) ?? [:]
-        var codexHooksDict = (codexRoot["hooks"] as? [String: Any]) ?? [:]
-        for event in events {
-            let commandStr = "\(Proc.quote(ctlPath)) hook codex \(event)"
-            let hookItem: [String: Any] = [
-                "type": "command",
-                "command": commandStr,
-                "timeout": 10
-            ]
-            let group: [String: Any] = [
-                "hooks": [hookItem]
-            ]
-            let existingGroups = (codexHooksDict[event] as? [Any]) ?? []
-            codexHooksDict[event] = updateHookGroups(existing: existingGroups, replacement: group)
+        for dir in geminiDirs where FileManager.default.fileExists(atPath: dir.path) {
+            let file = dir.appendingPathComponent("hooks.json")
+            try backupIfNeeded(file)
+            var root = try readJSON(from: file) ?? [:]
+            root.removeValue(forKey: "notch-agents")
+            func command(_ event: String) -> [String: Any] {
+                ["type": "command", "command": "\(Proc.quote(ctlPath)) hook antigravity \(event)", "timeout": 5]
+            }
+            root["agent-hub"] = ["enabled": true, "PreInvocation": [command("PreInvocation")], "PostToolUse": [["matcher": "*", "hooks": [command("PostToolUse")]]], "Stop": [command("Stop")]]
+            try writeJSON(root, to: file)
+            messages.append("Installed hooks into \(file.path)")
         }
-        codexRoot["hooks"] = codexHooksDict
-        try writeJSON(codexRoot, to: codexHooks)
+        if FileManager.default.fileExists(atPath: opencodeConfigDir.path) {
+            let dir = opencodeConfigDir.appendingPathComponent("plugin")
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            let old = dir.appendingPathComponent("notch-agents.js")
+            if FileManager.default.fileExists(atPath: old.path) {
+                // Never overwrite an earlier migration backup.
+                var backup = dir.appendingPathComponent("notch-agents.js.bak-agenthub")
+                if FileManager.default.fileExists(atPath: backup.path) { backup = dir.appendingPathComponent("notch-agents.js.bak-agenthub-\(Int(Date().timeIntervalSince1970))") }
+                try FileManager.default.moveItem(at: old, to: backup)
+            }
+            let plugin = dir.appendingPathComponent("agent-hub.js")
+            try OpenCodePlugin.template(ctlPath: ctlPath, livePath: livePath.path).write(to: plugin, atomically: true, encoding: .utf8)
+            messages.append("Installed plugin into \(plugin.path)")
+        }
+        return messages
+    }
 
-        return [
-            "Installed hooks into \(claudeSettings.path)",
-            "Installed hooks into \(codexHooks.path)"
-        ]
+    private func events(_ harness: String) -> [String] {
+        ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse"] + (harness == "claude" ? ["Notification"] : []) + ["Stop", "SessionEnd", "PermissionRequest"]
+    }
+    private func isRetiredGroup(_ value: Any) -> Bool {
+        guard let group = value as? [String: Any] else { return false }
+        let items = (group["hooks"] as? [[String: Any]] ?? []) + [group]
+        return items.contains { item in
+            let cmd = item["command"] as? String ?? ""
+            return cmd.contains("notch-agent-bridge") || cmd.contains("agent-hub/startup/hub-hook.py")
+        }
     }
 
     /// Sets statusLine = {"type":"command","command":"'<ctlPath>' statusline"} in Claude settings.
@@ -168,6 +183,13 @@ public struct HookInstaller: Sendable {
                 try writeJSON(root, to: codexHooks)
             }
         }
+
+        for dir in geminiDirs {
+            let file = dir.appendingPathComponent("hooks.json")
+            if var root = try readJSON(from: file), root.removeValue(forKey: "agent-hub") != nil { try writeJSON(root, to: file) }
+        }
+        let plugin = opencodeConfigDir.appendingPathComponent("plugin/agent-hub.js")
+        if FileManager.default.fileExists(atPath: plugin.path) { try FileManager.default.removeItem(at: plugin) }
     }
 
     /// Reports whether each file has our hooks.
@@ -177,6 +199,11 @@ public struct HookInstaller: Sendable {
         return [
             "claude": claude,
             "codex": codex,
+            "antigravity": geminiDirs.contains { dir in
+                guard let root = try? readJSON(from: dir.appendingPathComponent("hooks.json")) else { return false }
+                return root["agent-hub"] != nil
+            },
+            "opencode": FileManager.default.fileExists(atPath: opencodeConfigDir.appendingPathComponent("plugin/agent-hub.js").path),
             claudeSettings.path: claude,
             codexHooks.path: codex
         ]
@@ -280,7 +307,7 @@ public struct HookInstaller: Sendable {
         else {
             return false
         }
-        let events = ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"]
+        let events = events(url == claudeSettings ? "claude" : "codex")
         return events.allSatisfy { event in
             guard let groups = hooks[event] as? [Any] else { return false }
             return groups.contains { isAgentHubGroup($0) }

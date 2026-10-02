@@ -21,7 +21,7 @@ import Testing
         let installer = HookInstaller(
             claudeSettings: claudeSettings,
             codexHooks: codexHooks,
-            ctlPath: ctlPath
+            ctlPath: ctlPath, geminiDirs: [], opencodeConfigDir: tempDir.appendingPathComponent("opencode"), livePath: tempDir.appendingPathComponent("live")
         )
 
         let result = try installer.install()
@@ -34,13 +34,13 @@ import Testing
         let claudeJSON = try #require(try JSONSerialization.jsonObject(with: claudeData) as? [String: Any])
         let claudeHooks = try #require(claudeJSON["hooks"] as? [String: Any])
 
-        let expectedEvents = ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"]
+        let expectedEvents = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd", "PermissionRequest"]
         for event in expectedEvents {
             let groups = try #require(claudeHooks[event] as? [[String: Any]])
             #expect(groups.count == 1)
             let group = groups[0]
 
-            if event == "PostToolUse" {
+            if ["PreToolUse", "PostToolUse", "PermissionRequest"].contains(event) {
                 #expect((group["matcher"] as? String) == "*")
             } else {
                 #expect(group["matcher"] == nil)
@@ -51,7 +51,7 @@ import Testing
             let hook = hooks[0]
             #expect((hook["type"] as? String) == "command")
             #expect((hook["command"] as? String) == "'/custom/path/agenthubctl' hook claude \(event)")
-            #expect((hook["timeout"] as? Int) == 10)
+            #expect((hook["timeout"] as? Int) == (event == "PermissionRequest" ? 600 : 10))
         }
 
         // Codex checks
@@ -63,14 +63,14 @@ import Testing
             let groups = try #require(codexHooksDict[event] as? [[String: Any]])
             #expect(groups.count == 1)
             let group = groups[0]
-            #expect(group["matcher"] == nil)
+            #expect((group["matcher"] as? String) == (["PreToolUse", "PostToolUse", "PermissionRequest"].contains(event) ? "*" : nil))
 
             let hooks = try #require(group["hooks"] as? [[String: Any]])
             #expect(hooks.count == 1)
             let hook = hooks[0]
             #expect((hook["type"] as? String) == "command")
             #expect((hook["command"] as? String) == "'/custom/path/agenthubctl' hook codex \(event)")
-            #expect((hook["timeout"] as? Int) == 10)
+            #expect((hook["timeout"] as? Int) == (event == "PermissionRequest" ? 600 : 10))
         }
     }
 
@@ -126,7 +126,7 @@ import Testing
         let installer = HookInstaller(
             claudeSettings: claudeSettings,
             codexHooks: codexHooks,
-            ctlPath: "/path/to/agenthubctl"
+            ctlPath: "/path/to/agenthubctl", geminiDirs: [], opencodeConfigDir: tempDir.appendingPathComponent("opencode"), livePath: tempDir.appendingPathComponent("live")
         )
         try installer.install()
 
@@ -138,7 +138,7 @@ import Testing
 
         let claudeHooks = try #require(updatedClaude["hooks"] as? [String: Any])
         let preToolGroups = try #require(claudeHooks["PreToolUse"] as? [[String: Any]])
-        #expect(preToolGroups.count == 1)
+        #expect(preToolGroups.count == 2)
 
         let sessionStartGroups = try #require(claudeHooks["SessionStart"] as? [[String: Any]])
         #expect(sessionStartGroups.count == 2)
@@ -170,7 +170,7 @@ import Testing
         let installer = HookInstaller(
             claudeSettings: claudeSettings,
             codexHooks: codexHooks,
-            ctlPath: "/path/to/agenthubctl"
+            ctlPath: "/path/to/agenthubctl", geminiDirs: [], opencodeConfigDir: tempDir.appendingPathComponent("opencode"), livePath: tempDir.appendingPathComponent("live")
         )
 
         try installer.install()
@@ -180,7 +180,7 @@ import Testing
         let claudeJSON = try #require(try JSONSerialization.jsonObject(with: claudeData) as? [String: Any])
         let claudeHooks = try #require(claudeJSON["hooks"] as? [String: Any])
 
-        let expectedEvents = ["SessionStart", "UserPromptSubmit", "PostToolUse", "Stop", "SessionEnd"]
+        let expectedEvents = ["SessionStart", "UserPromptSubmit", "PreToolUse", "PostToolUse", "Stop", "SessionEnd", "PermissionRequest"]
         for event in expectedEvents {
             let groups = try #require(claudeHooks[event] as? [[String: Any]])
             #expect(groups.count == 1)
@@ -216,7 +216,7 @@ import Testing
         let installer1 = HookInstaller(
             claudeSettings: claudeSettings,
             codexHooks: codexHooks,
-            ctlPath: "/path/one/agenthubctl"
+            ctlPath: "/path/one/agenthubctl", geminiDirs: [], opencodeConfigDir: tempDir.appendingPathComponent("opencode"), livePath: tempDir.appendingPathComponent("live")
         )
         try installer1.install()
 
@@ -234,7 +234,7 @@ import Testing
         let installer2 = HookInstaller(
             claudeSettings: claudeSettings,
             codexHooks: codexHooks,
-            ctlPath: "/path/two/agenthubctl"
+            ctlPath: "/path/two/agenthubctl", geminiDirs: [], opencodeConfigDir: tempDir.appendingPathComponent("opencode"), livePath: tempDir.appendingPathComponent("live")
         )
         try installer2.install()
 
@@ -256,7 +256,7 @@ import Testing
         let installer = HookInstaller(
             claudeSettings: claudeSettings,
             codexHooks: codexHooks,
-            ctlPath: trickyPath
+            ctlPath: trickyPath, geminiDirs: [], opencodeConfigDir: tempDir.appendingPathComponent("opencode"), livePath: tempDir.appendingPathComponent("live")
         )
         try installer.install()
         try installer.installStatusLine()
@@ -286,7 +286,7 @@ import Testing
         let installer = HookInstaller(
             claudeSettings: claudeSettings,
             codexHooks: codexHooks,
-            ctlPath: "/path/to/agenthubctl"
+            ctlPath: "/path/to/agenthubctl", geminiDirs: [], opencodeConfigDir: tempDir.appendingPathComponent("opencode"), livePath: tempDir.appendingPathComponent("live")
         )
 
         // 1. Set when absent
@@ -302,7 +302,7 @@ import Testing
         let installer2 = HookInstaller(
             claudeSettings: claudeSettings,
             codexHooks: codexHooks,
-            ctlPath: "/new/path/agenthubctl"
+            ctlPath: "/new/path/agenthubctl", geminiDirs: [], opencodeConfigDir: tempDir.appendingPathComponent("opencode"), livePath: tempDir.appendingPathComponent("live")
         )
         let msg2 = try installer2.installStatusLine()
         #expect(!msg2.isEmpty)
@@ -346,7 +346,7 @@ import Testing
         let installer = HookInstaller(
             claudeSettings: claudeSettings,
             codexHooks: codexHooks,
-            ctlPath: "/path/to/agenthubctl"
+            ctlPath: "/path/to/agenthubctl", geminiDirs: [], opencodeConfigDir: tempDir.appendingPathComponent("opencode"), livePath: tempDir.appendingPathComponent("live")
         )
 
         // Install our hooks and statusline
@@ -424,7 +424,7 @@ import Testing
         let installer = HookInstaller(
             claudeSettings: claudeSettings,
             codexHooks: codexHooks,
-            ctlPath: "/path/to/agenthubctl"
+            ctlPath: "/path/to/agenthubctl", geminiDirs: [], opencodeConfigDir: tempDir.appendingPathComponent("opencode"), livePath: tempDir.appendingPathComponent("live")
         )
 
         // 1. Missing files
@@ -460,7 +460,7 @@ import Testing
         try "".write(to: initialTargetURL, atomically: true, encoding: .utf8)
         let initialTarget = initialTargetURL.path
 
-        let installer = HookInstaller(ctlPath: initialTarget)
+        let installer = HookInstaller(ctlPath: initialTarget, geminiDirs: [], opencodeConfigDir: tempDir.appendingPathComponent("opencode"), livePath: tempDir.appendingPathComponent("live"))
         try installer.installCLILink(at: linkURL)
 
         let target1 = try FileManager.default.destinationOfSymbolicLink(atPath: linkURL.path)
@@ -471,10 +471,52 @@ import Testing
         try "".write(to: newTargetURL, atomically: true, encoding: .utf8)
         let newTarget = newTargetURL.path
 
-        let installer2 = HookInstaller(ctlPath: newTarget)
+        let installer2 = HookInstaller(ctlPath: newTarget, geminiDirs: [], opencodeConfigDir: tempDir.appendingPathComponent("opencode"), livePath: tempDir.appendingPathComponent("live"))
         try installer2.installCLILink(at: linkURL)
 
         let target2 = try FileManager.default.destinationOfSymbolicLink(atPath: linkURL.path)
         #expect(target2 == newTarget)
+    }
+}
+
+extension HookInstallerTests {
+    @Test func migratesAllHarnessesAndPreservesOtherHooks() throws {
+        let root = try makeTempDir(); defer { try? FileManager.default.removeItem(at: root) }
+        let gemini = root.appendingPathComponent("gemini"), opencode = root.appendingPathComponent("opencode")
+        try FileManager.default.createDirectory(at: gemini, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: opencode.appendingPathComponent("plugin"), withIntermediateDirectories: true)
+        let claude = root.appendingPathComponent("claude.json"), codex = root.appendingPathComponent("codex.json")
+        let groups: [[String: Any]] = [
+            ["hooks": [["command": "python notch-agent-bridge claude Stop"]]],
+            ["hooks": [["command": "python /x/agent-hub/startup/hub-hook.py"]]],
+            ["hooks": [["command": "open -ga Antigravity"]]]
+        ]
+        for f in [claude, codex] { try JSONSerialization.data(withJSONObject: ["other": 42, "hooks": ["Stop": groups, "Unknown": groups]]).write(to: f) }
+        try JSONSerialization.data(withJSONObject: ["notch-agents": ["enabled": true], "other": "keep"]).write(to: gemini.appendingPathComponent("hooks.json"))
+        let old = opencode.appendingPathComponent("plugin/notch-agents.js")
+        try "old plugin".write(to: old, atomically: true, encoding: .utf8)
+        let installer = HookInstaller(claudeSettings: claude, codexHooks: codex, ctlPath: "/x/agent's hub/agenthubctl", geminiDirs: [gemini], opencodeConfigDir: opencode, livePath: root.appendingPathComponent("live"))
+        try installer.install(); try installer.install()
+        for f in [claude, codex] {
+            let json = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: f)) as? [String: Any])
+            #expect(json["other"] as? Int == 42)
+            let hooks = try #require(json["hooks"] as? [String: Any])
+            #expect((hooks["Stop"] as? [Any])?.count == 2)
+            #expect((hooks["Unknown"] as? [Any])?.count == 1)
+            #expect(hooks["PermissionRequest"] != nil)
+            if f == claude { #expect(hooks["Notification"] != nil) }
+        }
+        let g = try #require(JSONSerialization.jsonObject(with: Data(contentsOf: gemini.appendingPathComponent("hooks.json"))) as? [String: Any])
+        #expect(g["notch-agents"] == nil && g["agent-hub"] != nil)
+        #expect(g["other"] as? String == "keep")
+        #expect(try String(contentsOf: opencode.appendingPathComponent("plugin/notch-agents.js.bak-agenthub"), encoding: .utf8) == "old plugin")
+        let plugin = try String(contentsOf: opencode.appendingPathComponent("plugin/agent-hub.js"), encoding: .utf8)
+        #expect(plugin.contains("spawn(BRIDGE, [\"hook\", \"opencode\", event]"))
+        #expect(!plugin.contains("python3"))
+        #expect(plugin.contains(root.appendingPathComponent("live").path))
+        #expect(installer.status()["antigravity"] == true && installer.status()["opencode"] == true)
+        try installer.uninstall()
+        #expect(installer.status()["antigravity"] == false && installer.status()["opencode"] == false)
+        #expect(FileManager.default.fileExists(atPath: opencode.appendingPathComponent("plugin/notch-agents.js.bak-agenthub").path))
     }
 }
