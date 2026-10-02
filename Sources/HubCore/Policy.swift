@@ -120,6 +120,78 @@ public enum PolicyEngine {
         return candidates.first
     }
     
+    public static func pickBroker(_ s: Snapshot, mainModel: String?) -> ModelEntry? {
+        let running = s.jobs.filter { $0.state == .running }
+        var candidates: [ModelEntry] = []
+        for model in s.config.models {
+            guard model.enabled && model.isWorker else { continue }
+            guard model.intelligence >= s.config.limits.brokerMinIntelligence && model.intelligence <= s.config.limits.brokerMaxIntelligence else { continue }
+            guard let harness = s.config.harness(model.harness) else { continue }
+            guard harness.trusted else { continue }
+            guard workerCap(s, model.harness) > 0 else { continue }
+            let b = band(s, model.harness)
+            guard b != .exhausted && b != .wrapUp else { continue }
+            candidates.append(model)
+        }
+        
+        var mainHarness: String? = nil
+        if let mId = mainModel, let mm = s.config.model(mId) { mainHarness = mm.harness }
+        
+        candidates.sort { a, b in
+            let aSame = a.harness == mainHarness
+            let bSame = b.harness == mainHarness
+            if aSame != bSame { return !aSame }
+            if a.intelligence != b.intelligence { return a.intelligence > b.intelligence }
+            let aLeft = left(s, a.harness) ?? 0.5
+            let bLeft = left(s, b.harness) ?? 0.5
+            if aLeft != bLeft { return aLeft > bLeft }
+            return a.id < b.id
+        }
+        return candidates.first
+    }
+
+    public static func plan(_ s: Snapshot, _ job: Job) -> (worker: ModelEntry, broker: ModelEntry?)? {
+        if job.privacy == .project && job.offload != false && (job.offload == true || s.config.limits.maskedOffloadSizes.contains(job.size.rawValue)) && job.kind == .implement {
+            if let broker = pickBroker(s, mainModel: job.mainModel) {
+                let running = s.jobs.filter { $0.state == .running }
+                if running.count < s.config.limits.maxJobs {
+                    var candidates: [ModelEntry] = []
+                    for model in s.config.models {
+                        guard model.enabled && model.isWorker && model.free else { continue }
+                        guard let harness = s.config.harness(model.harness) else { continue }
+                        guard !harness.trusted else { continue }
+                        if running.filter({ $0.harness == model.harness }).count >= workerCap(s, model.harness) { continue }
+                        candidates.append(model)
+                    }
+                    
+                    var mainHarness: String? = nil
+                    if let mId = job.mainModel, let mm = s.config.model(mId) { mainHarness = mm.harness }
+                    
+                    candidates.sort { a, b in
+                        let aSame = a.harness == mainHarness
+                        let bSame = b.harness == mainHarness
+                        if aSame != bSame { return !aSame }
+                        let aLeft = left(s, a.harness) ?? 0.5
+                        let bLeft = left(s, b.harness) ?? 0.5
+                        if aLeft != bLeft { return aLeft > bLeft }
+                        let aJobs = running.filter { $0.harness == a.harness }.count
+                        let bJobs = running.filter { $0.harness == b.harness }.count
+                        if aJobs != bJobs { return aJobs < bJobs }
+                        return a.id < b.id
+                    }
+                    
+                    if let worker = candidates.first {
+                        return (worker: worker, broker: broker)
+                    }
+                }
+            }
+        }
+        if let worker = pickWorker(s, job.size, job.kind, job.privacy, mainModel: job.mainModel) {
+            return (worker: worker, broker: nil)
+        }
+        return nil
+    }
+    
     public static func bestMain(_ s: Snapshot, excludingHarness: String?, planned: [String: Int]) -> ModelEntry? {
         var candidates = s.config.models.filter { $0.enabled && $0.isMain }
         if let ex = excludingHarness { candidates.removeAll { $0.harness == ex } }

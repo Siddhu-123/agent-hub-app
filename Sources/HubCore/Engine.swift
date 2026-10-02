@@ -117,9 +117,10 @@ import Combine
                 let runningCount = jobs.filter { $0.state == .running || inFlight.contains($0.id) }.count
                 if runningCount >= config.limits.maxJobs { break }
 
-                guard let worker = PolicyEngine.pickWorker(snap, job.size, job.kind, job.privacy, mainModel: job.mainModel) else {
+                guard let plan = PolicyEngine.plan(snap, job) else {
                     break
                 }
+                let worker = plan.worker
 
                 inFlight.insert(job.id)
                 // Count the job against its worker's harness for the rest of this pass.
@@ -127,10 +128,13 @@ import Combine
                     jobs[i].state = .running
                     jobs[i].harness = worker.harness
                     jobs[i].model = worker.id
+                    jobs[i].broker = plan.broker?.id
                 }
+                var startJob = job
+                startJob.broker = plan.broker?.id
                 let r = runner
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    let finalJob = r.start(job, worker: worker, now: Date())
+                    let finalJob = r.start(startJob, worker: worker, now: Date())
                     Task { @MainActor in
                         guard let self = self else { return }
                         self.inFlight.remove(finalJob.id)
