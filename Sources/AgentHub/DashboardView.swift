@@ -106,7 +106,7 @@ struct DashboardView: View {
             
             UsageBar(left: left, band: band)
             
-            if let reading = reading {
+            if let reading = reading, left != nil || reading.coolingUntil != nil {
                 if let cooling = reading.coolingUntil, cooling > Date() {
                     Text("Cooling until \(cooling, style: .time)")
                         .foregroundColor(.red)
@@ -116,7 +116,7 @@ struct DashboardView: View {
                         HStack {
                             Text(w.name)
                             Spacer()
-                            Text("\(Int(w.usedPercent))%")
+                            Text("\(Int(w.usedPercent))% used")
                                 .monospacedDigit()
                             if let r = w.resetsAt {
                                 Text("resets \(relativeDate(r))")
@@ -127,7 +127,7 @@ struct DashboardView: View {
                     }
                 }
             } else {
-                Text("Usage unknown")
+                Text("Usage unknown · treated as healthy")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }

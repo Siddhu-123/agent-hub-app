@@ -47,8 +47,7 @@ public struct UsageBar: View {
 
 public func relativeDate(_ date: Date?, now: Date = Date()) -> String {
     guard let date = date else { return "Never" }
-    let diff = now.timeIntervalSince(date)
-    if diff < 60 { return "Just now" }
+    if abs(now.timeIntervalSince(date)) < 60 { return "just now" }
     let formatter = RelativeDateTimeFormatter()
     formatter.unitsStyle = .abbreviated
     return formatter.localizedString(for: date, relativeTo: now)

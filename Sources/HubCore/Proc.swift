@@ -16,6 +16,8 @@ public enum Proc {
         if let cwd { p.currentDirectoryURL = URL(fileURLWithPath: cwd) }
         var environment = env ?? ProcessInfo.processInfo.environment
         environment["PATH"] = searchPath(environment["PATH"])
+        // Node/Bun CLIs resolve their working directory from PWD, which is inherited from the parent otherwise.
+        if let cwd { environment["PWD"] = cwd }
         p.environment = environment
         let out = Pipe()
         p.standardOutput = out
