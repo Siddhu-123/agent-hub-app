@@ -44,10 +44,56 @@ func appIsRunning(_ paths: HubPaths, now: Date) -> Bool {
     return now.timeIntervalSince(date) <= 90
 }
 
+func monitor(paths: HubPaths, follow: Bool, json: Bool) {
+    let file = paths.logs.appendingPathComponent("events.jsonl")
+    let decoder = JSONDecoder()
+    decoder.dateDecodingStrategy = .iso8601
+    let clock = DateFormatter()
+    clock.dateFormat = "HH:mm:ss"
+    func output(_ line: Data) {
+        if json { FileHandle.standardOutput.write(line + Data([10])); return }
+        guard let e = try? decoder.decode(ActivityEvent.self, from: line) else { return }
+        let detail = e.detail.keys.sorted().map { "\($0)=\(e.detail[$0]!)" }.joined(separator: " ")
+        print("\(clock.string(from: e.ts)) \(e.kind) \(e.job ?? "-") \(e.model ?? "-") \(detail)")
+        fflush(stdout)
+    }
+    func inode() -> UInt64? {
+        (try? FileManager.default.attributesOfItem(atPath: file.path)[.systemFileNumber] as? NSNumber)?.uint64Value
+    }
+    var handle = try? FileHandle(forReadingFrom: file)
+    var identity = inode()
+    var pending = (try? handle?.readToEnd()) ?? Data()
+    func lines() -> [Data] {
+        var result: [Data] = []
+        while let newline = pending.firstIndex(of: 10) {
+            result.append(Data(pending[..<newline]))
+            pending.removeSubrange(...newline)
+        }
+        return result
+    }
+    for line in lines().suffix(50) { output(line) }
+    guard follow else { try? handle?.close(); return }
+    while true {
+        Thread.sleep(forTimeInterval: 1)
+        if let data = try? handle?.readToEnd() { pending.append(data) }
+        for line in lines() { output(line) }
+        let next = inode()
+        if next != identity {
+            try? handle?.close()
+            handle = try? FileHandle(forReadingFrom: file)
+            identity = next
+            pending = Data()
+            if let data = try? handle?.readToEnd() { pending.append(data) }
+            for line in lines() { output(line) }
+        }
+    }
+}
+
 func run() throws -> Int32 {
     let a = try CLIArgs(Array(CommandLine.arguments.dropFirst()))
     let allowed: [String: Set<String>] = [
         "help": [], "hook": [], "statusline": [], "status": ["json"],
+        "monitor": ["follow", "json"], "stats": ["json"],
         "delegate": ["main", "size", "kind", "privacy", "project", "objective", "allowed-file", "check", "worktree", "wait", "dry-run", "offload"],
         "send": ["harness", "session", "message", "kind"],
         "handoff": ["from", "project", "file", "session", "to", "no-launch"],
@@ -98,6 +144,20 @@ func run() throws -> Int32 {
                                    env: ProcessInfo.processInfo.environment, now: now) {
             try printJSON(result)
         }
+    case "monitor": monitor(paths: paths, follow: a.has("follow"), json: a.has("json"))
+    case "stats":
+        let stats = Activity.stats(Activity.read(paths: paths, limit: Int.max))
+        if a.has("json") { try printJSON(jsonObject(stats)) }
+        else {
+            print("model\tstarted\tverified\tfailed\tqueued back\tavg seconds")
+            for model in stats.models.keys.sorted() {
+                let m = stats.models[model]!
+                print("\(model)\t\(m.started)\t\(m.verified)\t\(m.failed)\t\(m.queuedBack)\t\(String(format: "%.1f", m.avgSeconds))")
+            }
+            print("masked: \(stats.masked.passed)/\(stats.masked.attempted) passed · \(stats.masked.fallbacks) fallbacks")
+            for reason in stats.masked.fallbackReasons.keys.sorted() { print("  \(reason): \(stats.masked.fallbackReasons[reason]!)") }
+            print("handoffs: \(stats.handoffs) · wrap-ups: \(stats.wrapUps) · cooldowns: \(stats.cooldowns)")
+        }
     case "statusline":
         print(UsageMeter.writeClaudeStatusline(stdinJSON: FileHandle.standardInput.readDataToEndOfFile(), paths: paths, now: now))
     case "status":
@@ -135,6 +195,7 @@ func run() throws -> Int32 {
             return 0
         }
         let queued = try store.enqueue(job, now: now)
+        Activity.queued(queued, paths: paths)
         if a.has("wait") || !appIsRunning(paths, now: now) {
             var final = queued
             // A masked offload that is skipped comes back queued with offload off; run it once more on a trusted worker.

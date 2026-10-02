@@ -90,6 +90,7 @@ import Combine
     /// One policy cycle (SPEC §7 tick). schedule: false skips starting queued jobs (used by `agenthubctl tick`). ENGINE WORKER.
     public func tick(now: Date = Date(), schedule: Bool = true) {
         usage = UsageMeter(paths: paths).read(config, now: now)
+        Activity.usage(usage, paths: paths, now: now)
 
         let rel = relay(now: now)
         sessions = rel.sessions(activeOnly: true, now: now)
@@ -188,6 +189,7 @@ import Combine
     @discardableResult
     public func delegate(_ job: Job) throws -> Job {
         let stored = try JobStore(paths: paths).enqueue(job)
+        Activity.queued(stored, paths: paths)
         appendLog(["job queued: \(stored.id)"])
         tick()
         return stored

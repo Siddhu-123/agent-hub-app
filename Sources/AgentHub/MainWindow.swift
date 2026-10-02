@@ -6,7 +6,7 @@ struct MainWindow: View {
     @State private var selection: SidebarItem = .dashboard
     
     enum SidebarItem {
-        case dashboard, sessions, jobs, models, harnesses, settings
+        case dashboard, sessions, jobs, activity, models, harnesses, settings
     }
     
     var body: some View {
@@ -16,6 +16,7 @@ struct MainWindow: View {
                     NavigationLink(value: SidebarItem.dashboard) { Label("Dashboard", systemImage: "gauge") }
                     NavigationLink(value: SidebarItem.sessions) { Label("Sessions", systemImage: "terminal") }
                     NavigationLink(value: SidebarItem.jobs) { Label("Jobs", systemImage: "checklist") }
+                    NavigationLink(value: SidebarItem.activity) { Label("Activity", systemImage: "waveform.path") }
                 }
                 Section("Configuration") {
                     NavigationLink(value: SidebarItem.models) { Label("Models", systemImage: "cpu") }
@@ -43,6 +44,7 @@ struct MainWindow: View {
                 case .dashboard: DashboardView()
                 case .sessions: SessionsView()
                 case .jobs: JobsView()
+                case .activity: ActivityView()
                 case .models: ModelsView()
                 case .harnesses: HarnessesView()
                 case .settings: SettingsView()
