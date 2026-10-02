@@ -4,8 +4,9 @@ import Foundation
 public enum Proc {
     /// Runs argv (no shell) with a time bound. argv[0] may be a bare name; it is resolved with `resolve`.
     /// Output is truncated to the last `keep` characters. Never throws: launch failures return exit code 127.
+    /// `onStart` receives the child PID right after launch (used for cancellation).
     public static func run(_ argv: [String], cwd: String? = nil, env: [String: String]? = nil, stdin: String? = nil,
-                           timeout: TimeInterval = 120, keep: Int = 200_000) -> CheckResult {
+                           timeout: TimeInterval = 120, keep: Int = 200_000, onStart: ((Int32) -> Void)? = nil) -> CheckResult {
         guard let first = argv.first, let exe = resolve(first) else {
             return CheckResult(argv: argv, exitCode: 127, timedOut: false, output: "executable not found: \(argv.first ?? "")")
         }
@@ -27,6 +28,7 @@ public enum Proc {
             out.fileHandleForReading.readabilityHandler = nil
             return CheckResult(argv: argv, exitCode: 127, timedOut: false, output: "launch failed: \(error.localizedDescription)")
         }
+        onStart?(p.processIdentifier)
         if let stdin {
             DispatchQueue.global().async {
                 try? input.fileHandleForWriting.write(contentsOf: Data(stdin.utf8))
