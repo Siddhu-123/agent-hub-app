@@ -20,6 +20,8 @@ public struct HubPaths: Sendable {
     public var cooldowns: URL { root.appendingPathComponent("cooldowns.json") }
     public var claudeUsage: URL { root.appendingPathComponent("usage-claude.json") }
     public var locks: URL { root.appendingPathComponent("locks") }
+    /// Isolated git worktrees for jobs whose checkout is busy (kept outside user projects).
+    public var worktrees: URL { root.appendingPathComponent("worktrees") }
 
     /// The process env marker that tells hooks a session was started by the hub as a worker (not a main session).
     public static let workerEnv = "AGENT_HUB_WORKER"
