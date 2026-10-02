@@ -15,6 +15,25 @@ struct AgentHubApp: App {
         _engine = StateObject(wrappedValue: e)
         e.start()
         
+        if ProcessInfo.processInfo.environment["AGENT_HUB_TEST"] == nil {
+            NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated {
+                    e.stop()
+                }
+            }
+            
+            UserDefaults.standard.register(defaults: ["launchNotch": true])
+            let launchNotch = UserDefaults.standard.bool(forKey: "launchNotch")
+            let notchRunning = NSWorkspace.shared.runningApplications.contains { $0.bundleIdentifier == HubPaths.notchBundleID }
+            if launchNotch && !notchRunning {
+                if let notchURL = NSWorkspace.shared.urlForApplication(withBundleIdentifier: HubPaths.notchBundleID) {
+                    let config = NSWorkspace.OpenConfiguration()
+                    config.activates = false
+                    NSWorkspace.shared.openApplication(at: notchURL, configuration: config) { _, _ in }
+                }
+            }
+        }
+        
         if Bundle.main.bundleIdentifier != nil {
             UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
         }

@@ -3,16 +3,17 @@ import HubCore
 
 struct MainWindow: View {
     @EnvironmentObject var engine: Engine
-    @State private var selection: SidebarItem = .dashboard
+    @State private var selection: SidebarItem = .live
     
     enum SidebarItem {
-        case dashboard, sessions, jobs, activity, models, harnesses, settings
+        case live, dashboard, sessions, jobs, activity, models, harnesses, settings
     }
     
     var body: some View {
         NavigationSplitView {
             List(selection: $selection) {
                 Section("Agent Hub") {
+                    NavigationLink(value: SidebarItem.live) { Label("Live", systemImage: "dot.radiowaves.left.and.right") }
                     NavigationLink(value: SidebarItem.dashboard) { Label("Dashboard", systemImage: "gauge") }
                     NavigationLink(value: SidebarItem.sessions) { Label("Sessions", systemImage: "terminal") }
                     NavigationLink(value: SidebarItem.jobs) { Label("Jobs", systemImage: "checklist") }
@@ -41,6 +42,7 @@ struct MainWindow: View {
                 }
                 
                 switch selection {
+                case .live: LiveView()
                 case .dashboard: DashboardView()
                 case .sessions: SessionsView()
                 case .jobs: JobsView()

@@ -19,6 +19,10 @@ import Combine
     /// HookInstaller.status() result.
     @Published public private(set) var hookStatus: [String: Bool] = [:]
     @Published public private(set) var lastTick: Date?
+    @Published public private(set) var liveSessions: [LiveSession] = []
+    @Published public private(set) var liveRequests: [LiveRequest] = []
+
+    public let live: LiveFeed
 
     /// Called with each batch of new log lines (already timestamped), e.g. for notifications.
     public var onLog: (([String]) -> Void)?
@@ -27,6 +31,7 @@ import Combine
     /// Absolute path of the bundled agenthubctl.
     public let ctlPath: String
     private var timer: Timer?
+    private var pulseTimer: Timer?
 
     private let exec: Runner.Exec?
     private let openScript: (@Sendable (URL) -> Bool)?
@@ -44,6 +49,7 @@ import Combine
     public init(paths: HubPaths = HubPaths(), ctlPath: String, exec: Runner.Exec? = nil, openScript: (@Sendable (URL) -> Bool)? = nil, push: (@Sendable ([String]) -> Bool)? = nil, interrupt: (@Sendable (Int32) -> Void)? = nil) {
         self.paths = paths
         self.ctlPath = ctlPath
+        self.live = LiveFeed(paths: paths)
         self.exec = exec
         self.openScript = openScript
         self.push = push
@@ -63,18 +69,81 @@ import Combine
         })
     }
 
-    /// Starts the 30-second tick timer and ticks once.
+    /// Starts the 30-second tick timer, 2-second pulse timer and ticks/pulses once.
     public func start() {
         guard timer == nil else { return }
         tick()
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.tick() }
         }
+        pulse()
+        let pTimer = Timer(timeInterval: 2, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.pulse() }
+        }
+        RunLoop.current.add(pTimer, forMode: .common)
+        pulseTimer = pTimer
     }
 
     public func stop() {
         timer?.invalidate()
         timer = nil
+        pulseTimer?.invalidate()
+        pulseTimer = nil
+        live.markStopped()
+    }
+
+    public func pulse() {
+        let s = snapshot()
+        var bands: [String: String] = [:]
+        for h in config.harnesses {
+            bands[h.id] = String(describing: PolicyEngine.band(s, h.id))
+        }
+        live.writeHeartbeat(jobs: s.jobs, usage: usage, bands: bands, hooks: hookStatus)
+
+        let feed = live
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let newSessions = feed.sessions().sorted { ($0.startedAt, $0.sessionId) < ($1.startedAt, $1.sessionId) }
+            let newRequests = feed.requests().sorted { ($0.createdAt, $0.id) < ($1.createdAt, $1.id) }
+            Task { @MainActor [weak self] in
+                guard let self = self else { return }
+                if !self.sessionsEqual(self.liveSessions, newSessions) {
+                    self.liveSessions = newSessions
+                }
+                if !self.requestsEqual(self.liveRequests, newRequests) {
+                    self.liveRequests = newRequests
+                }
+            }
+        }
+    }
+
+    private func sessionsEqual(_ a: [LiveSession], _ b: [LiveSession]) -> Bool {
+        guard a.count == b.count else { return false }
+        for (x, y) in zip(a, b) {
+            if x.sessionId != y.sessionId || x.platform != y.platform || x.status != y.status ||
+               x.activity != y.activity || x.steps != y.steps || x.title != y.title ||
+               x.model != y.model || x.cwd != y.cwd || x.turnStartedAt != y.turnStartedAt ||
+               x.updatedAt != y.updatedAt {
+                return false
+            }
+        }
+        return true
+    }
+
+    private func requestsEqual(_ a: [LiveRequest], _ b: [LiveRequest]) -> Bool {
+        guard a.count == b.count else { return false }
+        for (x, y) in zip(a, b) {
+            if x.id != y.id || x.kind != y.kind || x.title != y.title || x.detail != y.detail ||
+               x.canAnswer != y.canAnswer || x.options != y.options || x.choices != y.choices ||
+               x.header != y.header || x.createdAt != y.createdAt {
+                return false
+            }
+        }
+        return true
+    }
+
+    public func respond(_ request: LiveRequest, decision: String) {
+        live.respond(requestId: request.id, decision: decision)
+        liveRequests.removeAll { $0.id == request.id }
     }
 
     public func snapshot(now: Date = Date()) -> Snapshot {

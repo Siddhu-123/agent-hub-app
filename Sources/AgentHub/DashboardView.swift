@@ -40,6 +40,16 @@ struct DashboardView: View {
                     .cornerRadius(8)
                 }
                 
+                let workingCount = engine.liveSessions.filter { $0.status == "working" }.count
+                let waitingCount = engine.liveSessions.filter { $0.status == "waiting" }.count
+                HStack {
+                    Text("Live: \(workingCount) working · \(waitingCount) waiting")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
+                .padding(.horizontal, 4)
+                
                 VStack(alignment: .leading) {
                     Text("Policy Explanations")
                         .font(.headline)

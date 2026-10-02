@@ -7,6 +7,7 @@ struct SettingsView: View {
     @State private var draft: AppConfig?
     @State private var installError: Error?
     @State private var hookMessage: String?
+    @AppStorage("launchNotch") private var launchNotch: Bool = true
     
     var body: some View {
         Form {
@@ -77,6 +78,7 @@ struct SettingsView: View {
                 Section("General") {
                     Toggle("Auto Launch", isOn: binding.autoLaunch)
                     TextField("Terminal App", text: binding.terminalApp)
+                    Toggle("Launch Notch with Agent Hub", isOn: $launchNotch)
                 }
                 
                 Section("Integrations") {
