@@ -60,7 +60,15 @@ public enum Masked {
             if name == "map.json" || name == "check.json" { continue }
             guard let isRegular = try? fileURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile, isRegular else { continue }
             guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
-            
+            problems += scan(text: content, name: name, tokens: tokens)
+        }
+        return problems
+    }
+
+    public static func scan(text content: String, name: String, tokens: [String]) -> [String] {
+        var problems: [String] = []
+        do {
+            let fileURL = URL(fileURLWithPath: name)
             let patterns = ["/Users/", "/home/", "/Volumes/", "/private/", "~/"]
             for pattern in patterns {
                 if content.contains(pattern) {
@@ -84,6 +92,25 @@ public enum Masked {
             }
         }
         return problems
+    }
+
+    /// Check output for a retry, with the masked directories shown as "." and withheld entirely if anything private remains.
+    public static func feedback(_ output: String, dirs: [String], tokens: [String]) -> String {
+        var text = String(output.suffix(1500))
+        for dir in dirs.sorted(by: { $0.count > $1.count }) {
+            for spelling in [dir, URL(fileURLWithPath: dir).resolvingSymlinksInPath().path] { text = text.replacingOccurrences(of: spelling, with: ".") }
+        }
+        return scan(text: text, name: "output", tokens: tokens).isEmpty ? text : "(output withheld)"
+    }
+
+    public static func retryPrompt(_ base: String, feedback: String) -> String {
+        """
+        \(base)
+
+        Your previous attempt is already in the files, but the check failed:
+        \(feedback)
+        Fix the files so the check passes.
+        """
     }
 
     public static func maskPrompt(job: Job, runDir: String, maskDir: String) -> String {

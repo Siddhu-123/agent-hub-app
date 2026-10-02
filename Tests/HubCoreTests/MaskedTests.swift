@@ -75,6 +75,12 @@ struct MaskedTests {
         #expect(!Masked.scan(dir: maskDir, tokens: ["secrettoken"]).isEmpty)
     }
     
+    @Test func feedbackScrubsDirsAndWithholdsPrivateText() {
+        #expect(Masked.feedback("fail at /private/tmp/agenthub-mask-ab/files/x.py", dirs: ["/private/tmp/agenthub-mask-ab/files"], tokens: []) == "fail at ./x.py")
+        #expect(Masked.feedback("fail for zephyrco", dirs: [], tokens: ["zephyrco"]) == "(output withheld)")
+        #expect(Masked.feedback("see /Users/someone/x", dirs: [], tokens: []) == "(output withheld)")
+    }
+
     @Test func testRunnerFakeExec() throws {
         let s = snapshot()
         let paths = HubPaths(root: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hub-\(UUID().uuidString)"))
@@ -90,6 +96,7 @@ struct MaskedTests {
             _ = Proc.run(argv, cwd: paths.root.path)
         }
         
+        let workerPrompts = Box<[String]>([])
         runner.exec = { argv, cwd, env, stdin, timeout, pidCallback in
             let dir = cwd ?? ""
             if argv.contains(where: { $0 == "m1" }) {
@@ -110,11 +117,15 @@ struct MaskedTests {
                 guard env?["OPENCODE_CONFIG_CONTENT"] != nil, env?["XDG_DATA_HOME"]?.hasPrefix("/private/tmp/agenthub-") == true else {
                     return CheckResult(argv: argv, exitCode: 1, timedOut: false, output: "no stage env")
                 }
-                try? "edited code".write(to: URL(fileURLWithPath: dir).appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+                // The first attempt does nothing; the retry must carry the scrubbed check output.
+                workerPrompts.value.append(stdin ?? "")
+                if workerPrompts.value.count > 1 {
+                    try? "edited code".write(to: URL(fileURLWithPath: dir).appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+                }
                 return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "worker ok")
             } else if argv.last == "check.sh" {
                 let edited = (try? String(contentsOfFile: dir + "/main.swift", encoding: .utf8)) == "edited code"
-                return CheckResult(argv: argv, exitCode: edited ? 0 : 1, timedOut: false, output: edited ? "check ok" : "not edited")
+                return CheckResult(argv: argv, exitCode: edited ? 0 : 1, timedOut: false, output: edited ? "check ok" : "not edited: \(dir)/main.swift")
             } else if argv == ["sh", "test.sh"] {
                 return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "check ok")
             }
@@ -124,6 +135,9 @@ struct MaskedTests {
         let finalJob = runner.start(job, worker: s.config.model("m2")!, now: now)
         #expect(finalJob.state == .verified)
         #expect(finalJob.note == "masked via m1")
+        #expect(workerPrompts.value.count == 2)
+        #expect(workerPrompts.value.last?.contains("not edited: ./main.swift") == true)
+        #expect(workerPrompts.value.last?.contains("agenthub-mask") == false)
         #expect(try String(contentsOf: paths.root.appendingPathComponent("main.swift"), encoding: .utf8) == "decoded code")
     }
 

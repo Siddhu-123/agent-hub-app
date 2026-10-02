@@ -82,6 +82,7 @@ public struct Limits: Codable, Equatable, Sendable {
     /// Project jobs of these sizes go to a free untrusted worker through the masked pipeline:
     /// a trusted tier-3 broker masks the task, the free worker runs on the masked stage only, the broker decodes the result.
     public var maskedOffloadSizes: [String] = ["hard"]
+    public var maskedHeavyAttempts = 2
     /// Tier 3: trusted worker models in this intelligence range may act as the mask/decode broker.
     public var brokerMinIntelligence = 55
     public var brokerMaxIntelligence = 79
@@ -91,7 +92,7 @@ public struct Limits: Codable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case maxMainSessions, maxJobs, sameHarnessMinLeft, singleSessionBelow, wrapUpBelow, exhaustedAtOrBelow, workerMinLeft
         case graceSeconds, activeSeconds, maxStopBlocks, jobTimeoutSeconds, minIntelligence, interruptOnAutoHandoff
-        case maskedOffloadSizes, brokerMinIntelligence, brokerMaxIntelligence
+        case maskedOffloadSizes, maskedHeavyAttempts, brokerMinIntelligence, brokerMaxIntelligence
     }
 
     /// Keys missing from an older config keep their defaults instead of failing the whole file.
@@ -113,6 +114,7 @@ public struct Limits: Codable, Equatable, Sendable {
         minIntelligence = try v(.minIntelligence, d.minIntelligence)
         interruptOnAutoHandoff = try v(.interruptOnAutoHandoff, d.interruptOnAutoHandoff)
         maskedOffloadSizes = try v(.maskedOffloadSizes, d.maskedOffloadSizes)
+        maskedHeavyAttempts = try v(.maskedHeavyAttempts, d.maskedHeavyAttempts)
         brokerMinIntelligence = try v(.brokerMinIntelligence, d.brokerMinIntelligence)
         brokerMaxIntelligence = try v(.brokerMaxIntelligence, d.brokerMaxIntelligence)
     }

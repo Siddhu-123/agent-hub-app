@@ -350,37 +350,47 @@ public final class Runner: @unchecked Sendable {
         }
         defer { if let stage { Sandbox.cleanup(stage) } }
         
-        let workerRes = runHelper(j: &j, harness: workerHarness, worker: worker, prompt: Masked.heavyPrompt(brief: briefText, files: flatFiles.sorted()), cwd: stage?.dir.path ?? filesDir, projectEnv: stage?.dir.path ?? filesDir, useSandbox: true, now: now, store: store, baseEnv: stage?.env)
-        
-        if !workerRes.workerExited {
-            Cooldowns.set("harness:\(workerHarness.id)", until: workerRes.latestCooling, paths: paths)
-            j.state = .queued
-            j.harness = nil
-            j.model = nil
-            try? store.save(j)
-            return j
-        }
-        
-        do {
-            _ = try Sandbox.collect(stage!, into: filesDir)
-        } catch {
-            return fallbackMasked(job: j, reason: "Sandbox.collect failed: \(error)", store: store)
-        }
-        
-        // The check may run files the untrusted worker edited, so it runs in the same sandbox.
-        var checkEnv = stage?.env ?? ProcessInfo.processInfo.environment
-        checkEnv["PWD"] = filesDir
-        let checkRes = exec(Sandbox.wrap(checkArgv), filesDir, checkEnv, nil, 600) { pid in
+        // A free worker gets one more try with the scrubbed check output before the job falls back.
+        let basePrompt = Masked.heavyPrompt(brief: briefText, files: flatFiles.sorted())
+        var heavyPrompt = basePrompt
+        var lastFailure = ""
+        var passed = false
+        for _ in 0..<max(1, config.limits.maskedHeavyAttempts) {
+            let workerRes = runHelper(j: &j, harness: workerHarness, worker: worker, prompt: heavyPrompt, cwd: stage?.dir.path ?? filesDir, projectEnv: stage?.dir.path ?? filesDir, useSandbox: true, now: now, store: store, baseEnv: stage?.env)
+            
+            if !workerRes.workerExited {
+                Cooldowns.set("harness:\(workerHarness.id)", until: workerRes.latestCooling, paths: paths)
+                j.state = .queued
+                j.harness = nil
+                j.model = nil
+                try? store.save(j)
+                return j
+            }
+            
+            do {
+                _ = try Sandbox.collect(stage!, into: filesDir)
+            } catch {
+                return fallbackMasked(job: j, reason: "Sandbox.collect failed: \(error)", store: store)
+            }
+            
+            // The check may run files the untrusted worker edited, so it runs in the same sandbox.
+            var checkEnv = stage?.env ?? ProcessInfo.processInfo.environment
+            checkEnv["PWD"] = filesDir
+            let checkRes = exec(Sandbox.wrap(checkArgv), filesDir, checkEnv, nil, 600) { pid in
+                self.lock.lock()
+                self.pids[j.id] = pid
+                self.lock.unlock()
+            }
             self.lock.lock()
-            self.pids[j.id] = pid
+            self.pids.removeValue(forKey: j.id)
             self.lock.unlock()
+            
+            if checkRes.exitCode == 0 && !checkRes.timedOut { passed = true; break }
+            lastFailure = "masked check failed: \(String(checkRes.output.suffix(800)))\nworker output: \(String(workerRes.output.suffix(1500)))"
+            heavyPrompt = Masked.retryPrompt(basePrompt, feedback: Masked.feedback(checkRes.output, dirs: [filesDir, maskDir, stage?.dir.path ?? filesDir], tokens: tokens))
         }
-        self.lock.lock()
-        self.pids.removeValue(forKey: j.id)
-        self.lock.unlock()
-        
-        if checkRes.exitCode != 0 || checkRes.timedOut {
-            return fallbackMasked(job: j, reason: "masked check failed: \(String(checkRes.output.suffix(800)))\nworker output: \(String(workerRes.output.suffix(1500)))", store: store)
+        if !passed {
+            return fallbackMasked(job: j, reason: lastFailure, store: store)
         }
         
         // DECODE
