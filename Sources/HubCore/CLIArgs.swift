@@ -11,6 +11,8 @@ public struct CLIArgs {
       hook <harness> <event>
       statusline
       status [--json]
+      monitor [--follow] [--json]
+      stats [--json]
       delegate --main MODEL --project DIR --objective TEXT --allowed-file FILE ...
                --check '["command","arg"]' [--size tiny|routine|hard]
                [--kind implement|review|plan] [--privacy project|generic]
@@ -27,7 +29,7 @@ public struct CLIArgs {
     public init(_ arguments: [String]) throws {
         subcommand = arguments.first ?? "help"
         let values: Set<String> = ["main", "size", "kind", "privacy", "project", "objective", "allowed-file", "check", "harness", "session", "message", "from", "file", "to", "offload"]
-        let switches: Set<String> = ["json", "wait", "dry-run", "worktree", "all", "statusline", "force", "no-launch"]
+        let switches: Set<String> = ["json", "wait", "dry-run", "worktree", "all", "statusline", "force", "no-launch", "follow"]
         var i = 1
         while i < arguments.count {
             let token = arguments[i]

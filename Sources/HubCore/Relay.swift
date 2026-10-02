@@ -123,9 +123,12 @@ public struct Relay: Sendable {
 
         let session = touch(harness, sid, cwd: cwd, event: event, model: model, pid: pid, now: now)
 
-        if event == "SessionStart" || event == "SessionEnd" { return nil }
+        if event == "SessionStart" || event == "SessionEnd" {
+            Activity.log("session.event", harness: harness, model: model, ["event": event, "session": String(sid.prefix(8)), "project": URL(fileURLWithPath: session.cwd).lastPathComponent], paths: paths, now: now)
+            return nil
+        }
 
-        let snapshot = Snapshot(config: config, usage: usageProvider(), sessions: sessions(now: now), jobs: [], now: now)
+        let snapshot = Snapshot(config: config, usage: measuredUsage(now: now), sessions: sessions(now: now), jobs: [], now: now)
         let actions = PolicyEngine.rebalance(snapshot, alreadyWarned: Set(snapshot.sessions.compactMap { $0.warned != nil ? $0.id : nil }))
         
         if let action = actions.first(where: {
@@ -137,6 +140,7 @@ public struct Relay: Sendable {
                 if !pMsgs.contains(where: { $0.kind == .wrapUp }) {
                     let text = wrapUpText(harness: harness, sid: sid, target: target, reason: reason, cwd: session.cwd)
                     _ = try? send(harness, sid, text, kind: .wrapUp, now: now)
+                    Activity.log("policy.wrapup", harness: harness, ["to": target?.id ?? "none"], paths: paths, now: now)
                 }
                 FileStore.withLock(paths, "session-" + FileStore.key(harness, sid)) {
                     let file = paths.sessions.appendingPathComponent("\(FileStore.key(harness, sid)).json")
@@ -202,7 +206,17 @@ public struct Relay: Sendable {
         return lines.joined(separator: "\n")
     }
 
+    private func measuredUsage(now: Date) -> [String: UsageReading] {
+        let readings = usageProvider()
+        Activity.usage(readings, paths: paths, now: now)
+        return readings
+    }
+
     public func handoff(from harness: String, session: String?, project: String, file: String, to modelId: String?, launch: Bool, automatic: Bool, now: Date) throws -> HandoffRecord {
+        var succeeded = false
+        defer {
+            if !succeeded { Activity.log("policy.handoff_failed", harness: harness, ["from": harness, "to": modelId ?? "auto", "automatic": String(automatic)], paths: paths, now: now) }
+        }
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: project, isDirectory: &isDir), isDir.boolValue else {
             throw HubError.invalid("Project is not an existing directory")
@@ -219,7 +233,7 @@ public struct Relay: Sendable {
             guard let m = config.model(mId) else { throw HubError.invalid("Target model not found") }
             target = m
         } else {
-            let snapshot = Snapshot(config: config, usage: usageProvider(), sessions: sessions(now: now), jobs: [], now: now)
+            let snapshot = Snapshot(config: config, usage: measuredUsage(now: now), sessions: sessions(now: now), jobs: [], now: now)
             guard let best = PolicyEngine.bestMain(snapshot, excludingHarness: harness, planned: [:]) else {
                 throw HubError.noCapacity("No capacity for handoff")
             }
@@ -284,6 +298,8 @@ public struct Relay: Sendable {
             }
         }
 
+        succeeded = true
+        Activity.log("policy.handoff", harness: harness, model: target.id, ["from": harness, "to": target.id, "automatic": String(automatic)], paths: paths, now: now)
         return record
     }
 
@@ -315,6 +331,7 @@ public struct Relay: Sendable {
                 if !pMsgs.contains(where: { $0.kind == .wrapUp }) {
                     let text = wrapUpText(harness: session.harness, sid: session.sessionId, target: target, reason: reason, cwd: session.cwd)
                     _ = try? send(session.harness, session.sessionId, text, kind: .wrapUp, now: now)
+                    Activity.log("policy.wrapup", harness: session.harness, ["to": target?.id ?? "none"], paths: paths, now: now)
                     logs.append("wrap-up: \(session.harness) session \(session.sessionId.prefix(8)) → \(target?.name ?? "no target") (\(reason))")
 
                     FileStore.withLock(paths, "session-" + FileStore.key(session.harness, session.sessionId)) {

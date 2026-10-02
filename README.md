@@ -179,3 +179,10 @@ This adds the model, sets `isMain = true`, and appends it to `mainOrder`. The po
 - **Codex hooks** must be approved once inside Codex after installing (Codex trusts hooks by hash).
 - If the older Python `agent-hub` hooks are also installed, both sets run; uninstall one to avoid duplicate messages.
 - Data lives in `~/Library/Application Support/AgentHub` (`AGENT_HUB_HOME` overrides it).
+
+## Live monitoring
+
+Events are appended to `~/Library/Application Support/AgentHub/logs/events.jsonl`
+(or `$AGENT_HUB_HOME/logs/events.jsonl`). Run `agenthubctl monitor --follow` to
+watch live events and `agenthubctl stats` for counts and timings. Both support
+`--json`. The app's Activity tab shows the live log, filters and summary stats.
