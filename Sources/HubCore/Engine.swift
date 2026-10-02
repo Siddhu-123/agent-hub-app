@@ -20,6 +20,9 @@ import Combine
     @Published public private(set) var hookStatus: [String: Bool] = [:]
     @Published public private(set) var lastTick: Date?
 
+    /// Called with each batch of new log lines (already timestamped), e.g. for notifications.
+    public var onLog: (([String]) -> Void)?
+
     public let paths: HubPaths
     /// Absolute path of the bundled agenthubctl.
     public let ctlPath: String
@@ -133,8 +136,11 @@ import Combine
     }
 
     func appendLog(_ lines: [String], now: Date = Date()) {
+        guard !lines.isEmpty else { return }
         let stamp = ISO8601DateFormatter().string(from: now)
-        log.append(contentsOf: lines.map { "\(stamp) \($0)" })
+        let stamped = lines.map { "\(stamp) \($0)" }
+        log.append(contentsOf: stamped)
+        onLog?(stamped)
         if log.count > 200 { log.removeFirst(log.count - 200) }
     }
 }
