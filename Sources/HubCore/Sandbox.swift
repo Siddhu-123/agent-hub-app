@@ -88,8 +88,14 @@ public enum Sandbox {
         
         // "ask" rather than "deny": denied tools are dropped from the request, which the free tier rejects. Headless runs auto-reject asks.
         var p: [String: String] = ["*": "ask"]
+        // OpenCode matches the path in several spellings (it reports /private/tmp paths without the leading slash).
+        let real = dir.resolvingSymlinksInPath().path
+        let roots = Set([dir.path, real, real.hasPrefix("/private/") ? String(real.dropFirst("/private".count)) : real])
         for basename in names.keys {
-            p["\(dir.path)/\(basename)"] = "allow"
+            for root in roots {
+                p["\(root)/\(basename)"] = "allow"
+                p["\(root.dropFirst())/\(basename)"] = "allow"
+            }
             p[basename] = "allow"
         }
         
