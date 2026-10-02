@@ -106,10 +106,16 @@ struct MaskedTests {
                 }
                 return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "broker ok")
             } else if argv.contains(where: { $0 == "m2" }) {
-                // untrusted worker
+                // untrusted worker: must get the sandbox stage env, not the user's
+                guard env?["OPENCODE_CONFIG_CONTENT"] != nil, env?["XDG_DATA_HOME"]?.hasPrefix("/private/tmp/agenthub-") == true else {
+                    return CheckResult(argv: argv, exitCode: 1, timedOut: false, output: "no stage env")
+                }
                 try? "edited code".write(to: URL(fileURLWithPath: dir).appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
                 return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "worker ok")
-            } else if argv == ["sh", "test.sh"] || argv == ["sh", "check.sh"] {
+            } else if argv.last == "check.sh" {
+                let edited = (try? String(contentsOfFile: dir + "/main.swift", encoding: .utf8)) == "edited code"
+                return CheckResult(argv: argv, exitCode: edited ? 0 : 1, timedOut: false, output: edited ? "check ok" : "not edited")
+            } else if argv == ["sh", "test.sh"] {
                 return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "check ok")
             }
             return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "ok")

@@ -350,7 +350,7 @@ public final class Runner: @unchecked Sendable {
         }
         defer { if let stage { Sandbox.cleanup(stage) } }
         
-        let workerRes = runHelper(j: &j, harness: workerHarness, worker: worker, prompt: Masked.heavyPrompt(brief: briefText, files: flatFiles.sorted()), cwd: stage?.dir.path ?? filesDir, projectEnv: stage?.dir.path ?? filesDir, useSandbox: true, now: now, store: store)
+        let workerRes = runHelper(j: &j, harness: workerHarness, worker: worker, prompt: Masked.heavyPrompt(brief: briefText, files: flatFiles.sorted()), cwd: stage?.dir.path ?? filesDir, projectEnv: stage?.dir.path ?? filesDir, useSandbox: true, now: now, store: store, baseEnv: stage?.env)
         
         if !workerRes.workerExited {
             Cooldowns.set("harness:\(workerHarness.id)", until: workerRes.latestCooling, paths: paths)
@@ -415,7 +415,7 @@ public final class Runner: @unchecked Sendable {
         return j
     }
     
-    private func runHelper(j: inout Job, harness: Harness, worker: ModelEntry, prompt: String, cwd: String, projectEnv: String, useSandbox: Bool, now: Date, store: JobStore) -> (passed: Bool, workerExited: Bool, latestCooling: Date, output: String) {
+    private func runHelper(j: inout Job, harness: Harness, worker: ModelEntry, prompt: String, cwd: String, projectEnv: String, useSandbox: Bool, now: Date, store: JobStore, baseEnv: [String: String]? = nil) -> (passed: Bool, workerExited: Bool, latestCooling: Date, output: String) {
         let candidates = harness.accounts.isEmpty ? [harness.executable] : harness.accounts
         var lastOutput = ""
         var workerExited = false
@@ -429,7 +429,7 @@ public final class Runner: @unchecked Sendable {
                 if let _ = Cooldowns.until(model: worker.id, paths: paths, now: now) { continue }
             }
             
-            var env = ProcessInfo.processInfo.environment
+            var env = baseEnv ?? ProcessInfo.processInfo.environment
             env[HubPaths.workerEnv] = "1"
             
             let stdin = harness.promptViaStdin ? prompt : nil
