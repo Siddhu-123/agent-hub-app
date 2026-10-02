@@ -60,8 +60,8 @@ import Combine
     public func workerCap(_ harness: String) -> Int { PolicyEngine.workerCap(snapshot(), harness) }
     public func canStartMain(_ modelId: String) -> (ok: Bool, reason: String) { PolicyEngine.canStartMain(snapshot(), modelId) }
 
-    /// One policy cycle (SPEC §7 tick). ENGINE WORKER.
-    public func tick(now: Date = Date()) {
+    /// One policy cycle (SPEC §7 tick). schedule: false skips starting queued jobs (used by `agenthubctl tick`). ENGINE WORKER.
+    public func tick(now: Date = Date(), schedule: Bool = true) {
         usage = UsageMeter(paths: paths).read(config, now: now)
         explain = PolicyEngine.explain(snapshot(now: now))
         hookStatus = installer.status()
