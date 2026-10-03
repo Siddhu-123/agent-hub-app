@@ -445,6 +445,152 @@ struct JobsTests {
     }
 
     @Test
+    func testWorktreeRequeueAfterQuotaStaleCopyReusesWorktree() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        
+        let stdProject = URL(fileURLWithPath: project).standardized.path
+        let sha256 = SHA256.hash(data: Data(stdProject.utf8)).map { String(format: "%02x", $0) }.joined()
+        try! FileManager.default.createDirectory(at: paths.locks, withIntermediateDirectories: true)
+        let lockPath = paths.locks.appendingPathComponent("\(sha256).lock").path
+        let fd = open(lockPath, O_CREAT | O_RDWR, 0o600)
+        flock(fd, LOCK_EX)
+        defer { flock(fd, LOCK_UN); close(fd) }
+        
+        var config = ConfigStore.defaults()
+        let harness = Harness(id: "custom", name: "Custom", executable: "c", accounts: ["acc1"], trusted: true, usageSource: .none, hookStyle: .none, mainArgs: [], workerArgs: [])
+        config.harnesses.append(harness)
+        let runner = Runner(paths: paths, config: config)
+        let worker = ModelEntry(id: "custom-model", harness: "custom", name: "Custom", intelligence: 50, isMain: false, isWorker: true)
+        
+        let job = Job(project: project, objective: "t", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, isolation: .worktree, created: Date())
+        let store = JobStore(paths: paths)
+        try! store.enqueue(job)
+        
+        // Stale copy of the job as originally enqueued (worktree is nil)
+        let staleCopy = store.active().first!
+        #expect(staleCopy.worktree == nil)
+        
+        // First run: returns quota error exitCode 1
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            return CheckResult(argv: argv, exitCode: 1, timedOut: false, output: "429 rate limit exceeded resets in 1h")
+        }
+        
+        let now = Date()
+        let res1 = runner.start(staleCopy, worker: worker, now: now)
+        #expect(res1.state == .queued)
+        #expect(res1.worktree != nil)
+        let worktreeDir = res1.worktree!
+        #expect(FileManager.default.fileExists(atPath: worktreeDir))
+        
+        // Clear cooldowns
+        Cooldowns.set("account:acc1", until: now.addingTimeInterval(-10), paths: paths)
+        Cooldowns.set("harness:custom", until: now.addingTimeInterval(-10), paths: paths)
+        
+        // Second run: calling runner.start with staleCopy (worktree is nil)
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            let url = URL(fileURLWithPath: cwd!).appendingPathComponent("a.txt")
+            try! "content".write(to: url, atomically: true, encoding: .utf8)
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+        
+        let res2 = runner.start(staleCopy, worker: worker, now: now)
+        #expect(res2.state == .verified)
+        #expect(res2.worktree == worktreeDir)
+    }
+
+    @Test
+    func testWorktreeRecreatedFromExistingBranchWhenDirectoryDeleted() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        
+        let stdProject = URL(fileURLWithPath: project).standardized.path
+        let sha256 = SHA256.hash(data: Data(stdProject.utf8)).map { String(format: "%02x", $0) }.joined()
+        try! FileManager.default.createDirectory(at: paths.locks, withIntermediateDirectories: true)
+        let lockPath = paths.locks.appendingPathComponent("\(sha256).lock").path
+        let fd = open(lockPath, O_CREAT | O_RDWR, 0o600)
+        flock(fd, LOCK_EX)
+        defer { flock(fd, LOCK_UN); close(fd) }
+        
+        var config = ConfigStore.defaults()
+        let harness = Harness(id: "custom", name: "Custom", executable: "c", accounts: ["acc1"], trusted: true, usageSource: .none, hookStyle: .none, mainArgs: [], workerArgs: [])
+        config.harnesses.append(harness)
+        let runner = Runner(paths: paths, config: config)
+        let worker = ModelEntry(id: "custom-model", harness: "custom", name: "Custom", intelligence: 50, isMain: false, isWorker: true)
+        
+        let job = Job(project: project, objective: "t", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, isolation: .worktree, created: Date())
+        let store = JobStore(paths: paths)
+        try! store.enqueue(job)
+        
+        // First run: returns quota error exitCode 1
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            return CheckResult(argv: argv, exitCode: 1, timedOut: false, output: "429 rate limit exceeded resets in 1h")
+        }
+        
+        let now = Date()
+        let res1 = runner.start(store.active().first!, worker: worker, now: now)
+        #expect(res1.state == .queued)
+        guard let worktreeDir = res1.worktree else {
+            Issue.record("Expected worktree to be non-nil")
+            return
+        }
+        #expect(FileManager.default.fileExists(atPath: worktreeDir))
+        
+        // Delete worktree directory via FileManager without deleting git branch
+        try FileManager.default.removeItem(atPath: worktreeDir)
+        #expect(!FileManager.default.fileExists(atPath: worktreeDir))
+        
+        // Clear cooldowns
+        Cooldowns.set("account:acc1", until: now.addingTimeInterval(-10), paths: paths)
+        Cooldowns.set("harness:custom", until: now.addingTimeInterval(-10), paths: paths)
+        
+        // Second run: should recreate worktree from existing branch and succeed
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            let url = URL(fileURLWithPath: cwd!).appendingPathComponent("a.txt")
+            try! "content".write(to: url, atomically: true, encoding: .utf8)
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+        
+        let res2 = runner.start(store.active().first!, worker: worker, now: now)
+        #expect(res2.state == .verified)
+        #expect(res2.worktree == worktreeDir)
+        #expect(FileManager.default.fileExists(atPath: worktreeDir))
+    }
+
+    @Test
+    func testJobLockHeldPreventsExecution() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        
+        var config = ConfigStore.defaults()
+        let runner = Runner(paths: paths, config: config)
+        let worker = ModelEntry(id: "gpt-6.1-sol", harness: "codex", name: "GPT-6.1 Sol", intelligence: 97, isMain: true, isWorker: true, effort: "xhigh")
+        
+        let job = Job(project: project, objective: "t", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, isolation: .worktree, created: Date())
+        let store = JobStore(paths: paths)
+        try! store.enqueue(job)
+        let queuedJob = store.active().first!
+        
+        // Another fd holds flock on the job lock file
+        try! FileManager.default.createDirectory(at: paths.locks, withIntermediateDirectories: true)
+        let jobLockPath = paths.locks.appendingPathComponent("job-\(queuedJob.id).lock").path
+        let fd = open(jobLockPath, O_CREAT | O_RDWR, 0o600)
+        flock(fd, LOCK_EX)
+        defer { flock(fd, LOCK_UN); close(fd) }
+        
+        var execCalled = false
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            execCalled = true
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+        
+        let res = runner.start(queuedJob, worker: worker, now: Date())
+        #expect(res.state == .queued)
+        #expect(!execCalled)
+        #expect(store.get(queuedJob.id)?.state == .queued)
+    }
+
+    @Test
     func testSuccessfulOutputWithQuotaKeywordsNotTreatedAsQuota() throws {
         let paths = createTempPaths()
         let project = createTempProject()

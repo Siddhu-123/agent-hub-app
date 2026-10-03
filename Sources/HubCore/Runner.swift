@@ -41,6 +41,24 @@ public final class Runner: @unchecked Sendable {
         var j = job
         // Another process (the app or `agenthubctl delegate --wait`) may have claimed the job already.
         if let current = store.get(j.id), current.state != .queued { return current }
+        try? FileManager.default.createDirectory(at: paths.locks, withIntermediateDirectories: true)
+        let jobLockPath = paths.locks.appendingPathComponent("job-\(j.id).lock").path
+        let jobFd = open(jobLockPath, O_CREAT | O_RDWR, 0o600)
+        guard jobFd >= 0 else { return store.get(j.id) ?? j }
+        guard flock(jobFd, LOCK_EX | LOCK_NB) == 0 else {
+            close(jobFd)
+            return store.get(j.id) ?? j
+        }
+        defer {
+            flock(jobFd, LOCK_UN)
+            close(jobFd)
+        }
+        if let current = store.get(j.id) {
+            if current.state != .queued { return current }
+            if let wt = current.worktree, !wt.isEmpty { j.worktree = wt }
+            if let br = current.branch, !br.isEmpty { j.branch = br }
+            if !current.attempts.isEmpty { j.attempts = current.attempts }
+        }
         guard let harness = config.harness(worker.harness) else { return j }
         
         let stdProject = URL(fileURLWithPath: j.project).standardized.path
@@ -48,7 +66,6 @@ public final class Runner: @unchecked Sendable {
         let sha256 = SHA256.hash(data: projectData).map { String(format: "%02x", $0) }.joined()
         let lockName = sha256
         
-        try? FileManager.default.createDirectory(at: paths.locks, withIntermediateDirectories: true)
         let lockPath = paths.locks.appendingPathComponent("\(lockName).lock").path
         let fd = open(lockPath, O_CREAT | O_RDWR, 0o600)
         var lockHeld = false
@@ -68,21 +85,10 @@ public final class Runner: @unchecked Sendable {
                     var runDir = j.project
                     if !lockHeld {
                         if j.isolation == .worktree {
-                            if let existing = j.worktree, FileManager.default.fileExists(atPath: existing) {
-                                runDir = existing
+                            if let dir = ensureWorktree(for: &j, store: store) {
+                                runDir = dir
                             } else {
-                                runDir = paths.worktrees.appendingPathComponent(j.id).path
-                                try? FileManager.default.createDirectory(at: paths.worktrees, withIntermediateDirectories: true)
-                                let res = Proc.run(["git", "-C", j.project, "worktree", "add", runDir, "-b", "agenthub/\(j.id)"])
-                                if !res.passed {
-                                    j.state = .failed
-                                    j.note = "Worktree creation failed: \(res.output)"
-                                    try? store.save(j)
-                                    JobLog.mark(paths, j.id, "job failed")
-                                    return j
-                                }
-                                j.worktree = runDir
-                                j.branch = "agenthub/\(j.id)"
+                                return j
                             }
                         } else {
                             return j
@@ -112,21 +118,10 @@ public final class Runner: @unchecked Sendable {
         var runDir = j.project
         if !lockHeld {
             if j.isolation == .worktree {
-                if let existing = j.worktree, FileManager.default.fileExists(atPath: existing) {
-                    runDir = existing
+                if let dir = ensureWorktree(for: &j, store: store) {
+                    runDir = dir
                 } else {
-                    runDir = paths.worktrees.appendingPathComponent(j.id).path
-                    try? FileManager.default.createDirectory(at: paths.worktrees, withIntermediateDirectories: true)
-                    let res = Proc.run(["git", "-C", j.project, "worktree", "add", runDir, "-b", "agenthub/\(j.id)"])
-                    if !res.passed {
-                        j.state = .failed
-                        j.note = "Worktree creation failed: \(res.output)"
-                        try? store.save(j)
-                        JobLog.mark(paths, j.id, "job failed")
-                        return j
-                    }
-                    j.worktree = runDir
-                    j.branch = "agenthub/\(j.id)"
+                    return j
                 }
             } else {
                 return j // Still queued
@@ -286,6 +281,29 @@ public final class Runner: @unchecked Sendable {
         try? store.save(j)
         JobLog.mark(paths, j.id, "job \(j.state.rawValue)")
         return j
+    }
+    
+    private func ensureWorktree(for j: inout Job, store: JobStore) -> String? {
+        if let existing = j.worktree, FileManager.default.fileExists(atPath: existing) {
+            return existing
+        }
+        let runDir = paths.worktrees.appendingPathComponent(j.id).path
+        try? FileManager.default.createDirectory(at: paths.worktrees, withIntermediateDirectories: true)
+        var res = Proc.run(["git", "-C", j.project, "worktree", "add", runDir, "-b", "agenthub/\(j.id)"])
+        if !res.passed && Proc.run(["git", "-C", j.project, "rev-parse", "--verify", "--quiet", "refs/heads/agenthub/\(j.id)"]).passed {
+            _ = Proc.run(["git", "-C", j.project, "worktree", "prune"])
+            res = Proc.run(["git", "-C", j.project, "worktree", "add", runDir, "agenthub/\(j.id)"])
+        }
+        if !res.passed {
+            j.state = .failed
+            j.note = "Worktree creation failed: \(res.output)"
+            try? store.save(j)
+            JobLog.mark(paths, j.id, "job failed")
+            return nil
+        }
+        j.worktree = runDir
+        j.branch = "agenthub/\(j.id)"
+        return runDir
     }
     
     private func harnessTrusted(_ id: String) -> Bool { config.harness(id)?.trusted == true }
