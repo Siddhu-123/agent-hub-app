@@ -80,4 +80,15 @@ struct HubTreeTests {
         #expect(root?.children.first?.subtitle == "Find sources")
         #expect(root?.children.first?.active == true)
     }
+
+    @Test func verifiedReviewJobWithNoChangesYieldsPassedCheckNode() {
+        var reviewJob = job("review-1", state: .verified)
+        reviewJob.kind = .review
+        reviewJob.parentSession = "claude:s"
+        reviewJob.gate = GateResult(acceptance: CheckResult(argv: ["sh", "check.sh"], exitCode: 0, timedOut: false, output: "ok"), changedFiles: [], outsideAllowed: [])
+        let root = HubTree.build(sessions: [session("s")], jobs: [reviewJob], modelHarness: [:], now: now).first
+        let jobNode = try! #require(root?.children.first { $0.id == "j:review-1" })
+        let checkNode = try! #require(jobNode.children.first { $0.role == .check })
+        #expect(checkNode.status == "passed")
+    }
 }

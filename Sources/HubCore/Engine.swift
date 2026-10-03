@@ -219,6 +219,8 @@ import Combine
                                     reason = "outsideAllowed: \(gate.outsideAllowed.joined(separator: ", "))"
                                 } else if !gate.acceptance.passed {
                                     reason = "exit code \(gate.acceptance.exitCode)"
+                                } else if finalJob.kind == .implement && gate.changedFiles.isEmpty {
+                                    reason = "no files changed"
                                 }
                             }
                             logLine = "job needs review: \(finalJob.id) (\(reason))"

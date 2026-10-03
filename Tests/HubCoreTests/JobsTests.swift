@@ -571,6 +571,28 @@ struct JobsTests {
         #expect(finalJob.note == "decode helper failed")
         #expect(finalJob.gate != nil)
     }
+
+    @Test
+    func testGateResultPassedForKind() {
+        let okCheck = CheckResult(argv: ["sh", "check.sh"], exitCode: 0, timedOut: false, output: "ok")
+        
+        // review with exit 0, no changes, no outside files -> true
+        let reviewNoChanges = GateResult(acceptance: okCheck, changedFiles: [], outsideAllowed: [])
+        #expect(reviewNoChanges.passed(for: .review) == true)
+        
+        // review with outside files -> false
+        let reviewOutsideFiles = GateResult(acceptance: okCheck, changedFiles: [], outsideAllowed: ["other.swift"])
+        #expect(reviewOutsideFiles.passed(for: .review) == false)
+        
+        // implement with no changes -> false
+        let implementNoChanges = GateResult(acceptance: okCheck, changedFiles: [], outsideAllowed: [])
+        #expect(implementNoChanges.passed(for: .implement) == false)
+        
+        // implement with changes -> true
+        let implementWithChanges = GateResult(acceptance: okCheck, changedFiles: ["main.swift"], outsideAllowed: [])
+        #expect(implementWithChanges.passed(for: .implement) == true)
+    }
+
     // Swift Testing doesn't have expectation. We can just wait for it.
     private func expectation(description: String) -> Expectation {
         return Expectation()
@@ -580,3 +602,4 @@ struct JobsTests {
         func fulfill() { isFulfilled = true }
     }
 }
+

@@ -61,7 +61,7 @@ public enum HubTree {
             if let broker = job.broker {
                 children.append(HubNode(id: "b:\(job.id)", role: .broker, title: broker, subtitle: "mask · decode", status: job.state.rawValue, activity: "", active: job.state == .running, startedAt: job.started))
             }
-            let gateStatus = job.gate.map { $0.passed ? "passed" : "failed" } ?? "pending"
+            let gateStatus = job.gate.map { $0.passed(for: job.kind) ? "passed" : "failed" } ?? "pending"
             children.append(HubNode(id: "c:\(job.id)", role: .check, title: job.checkArgv.joined(separator: " ").isEmpty ? "check" : clipped(job.checkArgv.joined(separator: " "), 60), subtitle: "", status: gateStatus, activity: "", active: false, startedAt: job.finished ?? job.started))
             return HubNode(id: "j:\(job.id)", role: .worker, title: job.model ?? "waiting for a worker", subtitle: clipped(job.objective, 160), status: job.state.rawValue, activity: job.note ?? "", active: job.state == .running, startedAt: job.started ?? job.created, jobId: job.id, children: children)
         }

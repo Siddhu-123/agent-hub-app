@@ -21,7 +21,8 @@ struct JobsView: View {
                     TableColumn("Created") { j in Text(relativeDate(j.created)) }
                     TableColumn("Gate") { j in
                         if let g = j.gate {
-                            Text(g.passed ? "Pass" : "Fail").foregroundColor(g.passed ? .green : .red)
+                            let passed = g.passed(for: j.kind)
+                            Text(passed ? "Pass" : "Fail").foregroundColor(passed ? .green : .red)
                         } else {
                             Text("-")
                         }

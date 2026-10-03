@@ -30,7 +30,7 @@ public final class Runner: @unchecked Sendable {
         if result.started != job.started || result.state != job.state || result.offload != job.offload {
             Activity.log("job.finished", job: job.id, harness: worker.harness, model: worker.id,
                          ["state": result.state.rawValue, "seconds": String(format: "%.3f", Date().timeIntervalSince(began)),
-                          "changed": String(result.gate?.changedFiles.count ?? 0), "gate": result.gate.map { $0.passed ? "pass" : "fail" } ?? "none"], paths: paths)
+                          "changed": String(result.gate?.changedFiles.count ?? 0), "gate": result.gate.map { $0.passed(for: result.kind) ? "pass" : "fail" } ?? "none"], paths: paths)
         }
         return result
     }
@@ -279,11 +279,7 @@ public final class Runner: @unchecked Sendable {
         }
 
         if let g = j.gate {
-            if j.kind == .implement {
-                j.state = g.passed ? .verified : .needsReview
-            } else {
-                j.state = (g.acceptance.passed && g.outsideAllowed.isEmpty) ? .verified : .needsReview
-            }
+            j.state = g.passed(for: j.kind) ? .verified : .needsReview
         }
         
         j.finished = Date()

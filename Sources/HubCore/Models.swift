@@ -249,6 +249,14 @@ public struct GateResult: Codable, Equatable, Sendable {
     public var changedFiles: [String]
     public var outsideAllowed: [String]
     public var passed: Bool { acceptance.passed && outsideAllowed.isEmpty && !changedFiles.isEmpty }
+    public func passed(for kind: JobKind) -> Bool {
+        switch kind {
+        case .implement:
+            return passed
+        case .review, .plan:
+            return acceptance.passed && outsideAllowed.isEmpty
+        }
+    }
     public init(acceptance: CheckResult, changedFiles: [String], outsideAllowed: [String]) {
         self.acceptance = acceptance; self.changedFiles = changedFiles; self.outsideAllowed = outsideAllowed
     }
