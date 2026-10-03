@@ -3,16 +3,18 @@ import HubCore
 
 struct MainWindow: View {
     @EnvironmentObject var engine: Engine
-    @State private var selection: SidebarItem = .live
+    @State private var selection: SidebarItem = .tree
+    @State private var columns: NavigationSplitViewVisibility = .detailOnly
     
     enum SidebarItem {
-        case live, dashboard, sessions, jobs, activity, models, harnesses, settings
+        case tree, live, dashboard, sessions, jobs, activity, models, harnesses, settings
     }
     
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columns) {
             List(selection: $selection) {
                 Section("Agent Hub") {
+                    NavigationLink(value: SidebarItem.tree) { Label("Tree", systemImage: "point.3.connected.trianglepath.dotted") }
                     NavigationLink(value: SidebarItem.live) { Label("Live", systemImage: "dot.radiowaves.left.and.right") }
                     NavigationLink(value: SidebarItem.dashboard) { Label("Dashboard", systemImage: "gauge") }
                     NavigationLink(value: SidebarItem.sessions) { Label("Sessions", systemImage: "terminal") }
@@ -42,6 +44,7 @@ struct MainWindow: View {
                 }
                 
                 switch selection {
+                case .tree: TreeView()
                 case .live: LiveView()
                 case .dashboard: DashboardView()
                 case .sessions: SessionsView()
@@ -52,6 +55,10 @@ struct MainWindow: View {
                 case .settings: SettingsView()
                 }
             }
+        }
+        .onChange(of: selection) { _, item in
+            // The tree uses the whole window; the sidebar stays one toolbar click away.
+            withAnimation { columns = item == .tree ? .detailOnly : .all }
         }
     }
 }
