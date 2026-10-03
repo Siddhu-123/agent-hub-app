@@ -24,7 +24,7 @@ agenthubctl delegate --main gpt-6.1-sol --project "$PWD" \
 - `--dry-run` prints the chosen worker (and broker) without running anything.
 - `--check` is the acceptance argv (JSON array, no shell). It must pass for the job to be `verified`.
 - `--allowed-file` limits what the worker may change; edits elsewhere fail the gate.
-- `--worktree` runs the job in a git worktree, so parallel jobs never collide.
+- `--worktree` runs the job in the checkout when it is free and in a git worktree when another job holds the checkout, so parallel jobs never collide.
 - `--privacy project` (default) keeps project data with trusted models. Hard project jobs are offloaded through the masked pipeline: a trusted broker masks names and paths, a free sandboxed model does the work on the masked copy, the broker decodes it back and the gate runs. `--offload never` keeps a job on trusted models; `--offload always` forces masking.
 - `--privacy generic` is only for tasks with no project data at all.
 - The objective must stand alone: workers do not share the conversation.

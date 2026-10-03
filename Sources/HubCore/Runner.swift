@@ -68,18 +68,22 @@ public final class Runner: @unchecked Sendable {
                     var runDir = j.project
                     if !lockHeld {
                         if j.isolation == .worktree {
-                            runDir = paths.worktrees.appendingPathComponent(j.id).path
-                            try? FileManager.default.createDirectory(at: paths.worktrees, withIntermediateDirectories: true)
-                            let res = Proc.run(["git", "-C", j.project, "worktree", "add", runDir, "-b", "agenthub/\(j.id)"])
-                            if !res.passed {
-                                j.state = .failed
-                                j.note = "Worktree creation failed: \(res.output)"
-                                try? store.save(j)
-                                JobLog.mark(paths, j.id, "job failed")
-                                return j
+                            if let existing = j.worktree, FileManager.default.fileExists(atPath: existing) {
+                                runDir = existing
+                            } else {
+                                runDir = paths.worktrees.appendingPathComponent(j.id).path
+                                try? FileManager.default.createDirectory(at: paths.worktrees, withIntermediateDirectories: true)
+                                let res = Proc.run(["git", "-C", j.project, "worktree", "add", runDir, "-b", "agenthub/\(j.id)"])
+                                if !res.passed {
+                                    j.state = .failed
+                                    j.note = "Worktree creation failed: \(res.output)"
+                                    try? store.save(j)
+                                    JobLog.mark(paths, j.id, "job failed")
+                                    return j
+                                }
+                                j.worktree = runDir
+                                j.branch = "agenthub/\(j.id)"
                             }
-                            j.worktree = runDir
-                            j.branch = "agenthub/\(j.id)"
                         } else {
                             return j
                         }
@@ -108,18 +112,22 @@ public final class Runner: @unchecked Sendable {
         var runDir = j.project
         if !lockHeld {
             if j.isolation == .worktree {
-                runDir = paths.worktrees.appendingPathComponent(j.id).path
-                try? FileManager.default.createDirectory(at: paths.worktrees, withIntermediateDirectories: true)
-                let res = Proc.run(["git", "-C", j.project, "worktree", "add", runDir, "-b", "agenthub/\(j.id)"])
-                if !res.passed {
-                    j.state = .failed
-                    j.note = "Worktree creation failed: \(res.output)"
-                    try? store.save(j)
-                    JobLog.mark(paths, j.id, "job failed")
-                    return j
+                if let existing = j.worktree, FileManager.default.fileExists(atPath: existing) {
+                    runDir = existing
+                } else {
+                    runDir = paths.worktrees.appendingPathComponent(j.id).path
+                    try? FileManager.default.createDirectory(at: paths.worktrees, withIntermediateDirectories: true)
+                    let res = Proc.run(["git", "-C", j.project, "worktree", "add", runDir, "-b", "agenthub/\(j.id)"])
+                    if !res.passed {
+                        j.state = .failed
+                        j.note = "Worktree creation failed: \(res.output)"
+                        try? store.save(j)
+                        JobLog.mark(paths, j.id, "job failed")
+                        return j
+                    }
+                    j.worktree = runDir
+                    j.branch = "agenthub/\(j.id)"
                 }
-                j.worktree = runDir
-                j.branch = "agenthub/\(j.id)"
             } else {
                 return j // Still queued
             }
@@ -208,7 +216,7 @@ public final class Runner: @unchecked Sendable {
             }
             
             lastOutput = res.output
-            if let seconds = Cooldowns.fromOutput(res.output, now: now) {
+            if (res.exitCode != 0 || res.timedOut), let seconds = Cooldowns.fromOutput(res.output, now: now) {
                 let coolingUntil = now.addingTimeInterval(seconds)
                 latestCooling = coolingUntil
                 if !harness.accounts.isEmpty {
@@ -472,7 +480,10 @@ public final class Runner: @unchecked Sendable {
         
         // Gate
         j.gate = runGate(job: j, runDir: runDir, before: before, baseHead: baseHead)
-        if let g = j.gate {
+        if !decodeRes.passed {
+            j.state = .needsReview
+            j.note = "decode helper failed"
+        } else if let g = j.gate {
             if j.kind == .implement {
                 j.state = g.passed ? .verified : .needsReview
             } else {
@@ -481,7 +492,9 @@ public final class Runner: @unchecked Sendable {
         }
         j.finished = Date()
         j.output = "MASK (\(brokerModel.id)): ok\nHEAVY (\(worker.id)): masked check passed\nDECODE (\(brokerModel.id)): \(decodeRes.passed ? "ok" : "exit nonzero")\n\n" + String(decodeRes.output.suffix(2000))
-        j.note = "masked via \(brokerModel.id)"
+        if decodeRes.passed {
+            j.note = "masked via \(brokerModel.id)"
+        }
         try? store.save(j)
         JobLog.mark(paths, j.id, "job \(j.state.rawValue)")
         return j
@@ -538,7 +551,7 @@ public final class Runner: @unchecked Sendable {
             }
             
             lastOutput = res.output
-            if let seconds = Cooldowns.fromOutput(res.output, now: now) {
+            if (res.exitCode != 0 || res.timedOut), let seconds = Cooldowns.fromOutput(res.output, now: now) {
                 let coolingUntil = now.addingTimeInterval(seconds)
                 latestCooling = coolingUntil
                 if !harness.accounts.isEmpty {
@@ -689,7 +702,12 @@ public final class Runner: @unchecked Sendable {
         
         kill(pid, SIGTERM)
         DispatchQueue.global().asyncAfter(deadline: .now() + 2.0) {
-            kill(pid, SIGKILL)
+            self.lock.lock()
+            let stillRunning = self.pids[id] == pid
+            self.lock.unlock()
+            if stillRunning {
+                kill(pid, SIGKILL)
+            }
         }
     }
     

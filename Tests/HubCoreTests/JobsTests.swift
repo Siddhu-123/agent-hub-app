@@ -280,7 +280,185 @@ struct JobsTests {
         #expect(res.state == .cancelled)
     }
     
-    // Polyfill for expectation since we're in Swift Testing
+    @Test
+    func testWorktreeRequeueAfterQuotaReusesDirectory() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        
+        // Take lock so worktree is used
+        let stdProject = URL(fileURLWithPath: project).standardized.path
+        let sha256 = SHA256.hash(data: Data(stdProject.utf8)).map { String(format: "%02x", $0) }.joined()
+        try! FileManager.default.createDirectory(at: paths.locks, withIntermediateDirectories: true)
+        let lockPath = paths.locks.appendingPathComponent("\(sha256).lock").path
+        let fd = open(lockPath, O_CREAT | O_RDWR, 0o600)
+        flock(fd, LOCK_EX)
+        defer { flock(fd, LOCK_UN); close(fd) }
+        
+        var config = ConfigStore.defaults()
+        let harness = Harness(id: "custom", name: "Custom", executable: "c", accounts: ["acc1"], trusted: true, usageSource: .none, hookStyle: .none, mainArgs: [], workerArgs: [])
+        config.harnesses.append(harness)
+        let runner = Runner(paths: paths, config: config)
+        let worker = ModelEntry(id: "custom-model", harness: "custom", name: "Custom", intelligence: 50, isMain: false, isWorker: true)
+        
+        let job = Job(project: project, objective: "t", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, isolation: .worktree, created: Date())
+        let store = JobStore(paths: paths)
+        try! store.enqueue(job)
+        
+        // First run: returns quota error exitCode 1
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            return CheckResult(argv: argv, exitCode: 1, timedOut: false, output: "429 rate limit exceeded resets in 1h")
+        }
+        
+        let now = Date()
+        let res1 = runner.start(store.active().first!, worker: worker, now: now)
+        #expect(res1.state == .queued)
+        #expect(res1.worktree != nil)
+        let worktreeDir = res1.worktree!
+        #expect(FileManager.default.fileExists(atPath: worktreeDir))
+        
+        // Clear cooldowns
+        Cooldowns.set("account:acc1", until: now.addingTimeInterval(-10), paths: paths)
+        Cooldowns.set("harness:custom", until: now.addingTimeInterval(-10), paths: paths)
+        
+        // Second run: successful exec writes allowed file
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            let url = URL(fileURLWithPath: cwd!).appendingPathComponent("a.txt")
+            try! "content".write(to: url, atomically: true, encoding: .utf8)
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+        
+        let res2 = runner.start(store.active().first!, worker: worker, now: now)
+        #expect(res2.state == .verified)
+        #expect(res2.worktree == worktreeDir)
+    }
+
+    @Test
+    func testSuccessfulOutputWithQuotaKeywordsNotTreatedAsQuota() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        
+        let config = ConfigStore.defaults()
+        let runner = Runner(paths: paths, config: config)
+        let worker = ModelEntry(id: "gpt-6.1-sol", harness: "codex", name: "GPT-6.1 Sol", intelligence: 97, isMain: true, isWorker: true, effort: "xhigh")
+        
+        let job = Job(project: project, objective: "review quota logic", allowedFiles: ["a.txt"], checkArgv: ["echo", "ok"], size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let store = JobStore(paths: paths)
+        try! store.enqueue(job)
+        
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            let url = URL(fileURLWithPath: cwd!).appendingPathComponent("a.txt")
+            try! "content".write(to: url, atomically: true, encoding: .utf8)
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "code review complete: verified 429 rate limit exceeded resets in 1h handling")
+        }
+        
+        let now = Date()
+        let res = runner.start(store.active().first!, worker: worker, now: now)
+        #expect(res.state == .verified)
+        #expect(Cooldowns.until(model: "gpt-6.1-sol", paths: paths, now: now) == nil)
+    }
+
+    @Test
+    func testCancelDoesNotKillReusedPid() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        
+        let config = ConfigStore.defaults()
+        let runner = Runner(paths: paths, config: config)
+        let worker = ModelEntry(id: "gpt-6.1-sol", harness: "codex", name: "GPT-6.1 Sol", intelligence: 97, isMain: true, isWorker: true)
+        
+        let job = Job(project: project, objective: "t", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let store = JobStore(paths: paths)
+        try! store.enqueue(job)
+        let queuedJob = store.active().first!
+        
+        // Spawn a dummy process that stays alive, pretending its PID is later reused
+        let dummy = Process()
+        dummy.executableURL = URL(fileURLWithPath: "/bin/sleep")
+        dummy.arguments = ["10"]
+        try dummy.run()
+        defer {
+            dummy.terminate()
+            dummy.waitUntilExit()
+        }
+        let dummyPid = dummy.processIdentifier
+        
+        // exec reports dummyPid onStart, but exits immediately before runner.cancel is called
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            onStart(dummyPid)
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+        
+        _ = runner.start(queuedJob, worker: worker, now: Date())
+        // At this point, job finished and runner.pids[queuedJob.id] was removed.
+        // Calling cancel(queuedJob.id) should find no pid in pids, or if pid was captured before,
+        // the async recheck ensures pids[id] == pid before SIGKILL.
+        runner.cancel(queuedJob.id)
+        
+        // Wait 2.2 seconds for the async SIGKILL block to execute
+        Thread.sleep(forTimeInterval: 2.2)
+        
+        // dummy process must still be running (not killed by SIGKILL)
+        #expect(dummy.isRunning)
+    }
+
+    @Test
+    func testMaskedDecodeHelperFailureSetsNeedsReview() throws {
+        var lim = Limits()
+        lim.maxJobs = 4
+        lim.maskedOffloadSizes = ["hard"]
+        lim.brokerMinIntelligence = 55
+        lim.brokerMaxIntelligence = 79
+        let h1 = Harness(id: "h1", name: "h1", executable: "echo", trusted: true, usageSource: .none, hookStyle: .none, mainArgs: [], workerArgs: ["{exe}", "{model}"], promptViaStdin: true)
+        let h2 = Harness(id: "h2", name: "h2", executable: "echo", trusted: false, usageSource: .none, hookStyle: .none, mainArgs: [], workerArgs: ["{exe}", "{model}"], promptViaStdin: true)
+        let m1 = ModelEntry(id: "m1", harness: "h1", name: "m1", intelligence: 60, isMain: false, isWorker: true, free: false) // broker
+        let m2 = ModelEntry(id: "m2", harness: "h2", name: "m2", intelligence: 80, isMain: false, isWorker: true, free: true) // free worker
+        let config = AppConfig(harnesses: [h1, h2], models: [m1, m2], mainOrder: [], limits: lim)
+        
+        let paths = HubPaths(root: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hub-\(UUID().uuidString)"))
+        try? FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
+        let project = paths.root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        
+        var job = Job(project: project.path, objective: "obj", allowedFiles: ["main.swift"], checkArgv: ["sh", "test.sh"], size: .hard, kind: .implement, privacy: .project, created: Date())
+        job.broker = "m1"
+        try? "original code".write(to: project.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+        try "exit 0\n".write(to: project.appendingPathComponent("test.sh"), atomically: true, encoding: .utf8)
+        for argv in [["git", "init", "-q"], ["git", "add", "-A"], ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]] {
+            _ = Proc.run(argv, cwd: project.path)
+        }
+        
+        let runner = Runner(paths: paths, config: config)
+        runner.exec = { argv, cwd, env, stdin, timeout, pidCallback, onOutput in
+            let dir = cwd ?? ""
+            if argv.contains(where: { $0 == "m1" }) {
+                let prompt = stdin ?? ""
+                if prompt.contains("MASK step") {
+                    let filesDir = URL(fileURLWithPath: dir).appendingPathComponent("files")
+                    try? "generic brief".write(to: URL(fileURLWithPath: dir).appendingPathComponent("brief.md"), atomically: true, encoding: .utf8)
+                    try? "{\"placeholders\":{\"P1\":\"orig\"},\"files\":{\"main.swift\":\"main.swift\"}}".write(to: URL(fileURLWithPath: dir).appendingPathComponent("map.json"), atomically: true, encoding: .utf8)
+                    try? "[\"sh\",\"check.sh\"]".write(to: URL(fileURLWithPath: dir).appendingPathComponent("check.json"), atomically: true, encoding: .utf8)
+                    try? "masked code".write(to: filesDir.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+                    return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "mask ok")
+                } else if prompt.contains("DECODE step") {
+                    // Decode helper exits nonzero (failed)
+                    return CheckResult(argv: argv, exitCode: 1, timedOut: false, output: "decode error")
+                }
+            } else if argv.contains(where: { $0 == "m2" }) {
+                return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "worker ok")
+            } else if argv.last == "check.sh" {
+                return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "check ok")
+            } else if argv == ["sh", "test.sh"] {
+                // acceptance check passes
+                return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "acceptance ok")
+            }
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "ok")
+        }
+        
+        let finalJob = runner.start(job, worker: m2, now: Date())
+        #expect(finalJob.state == .needsReview)
+        #expect(finalJob.note == "decode helper failed")
+        #expect(finalJob.gate != nil)
+    }
     // Swift Testing doesn't have expectation. We can just wait for it.
     private func expectation(description: String) -> Expectation {
         return Expectation()
