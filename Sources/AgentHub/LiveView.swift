@@ -103,9 +103,11 @@ struct LiveView: View {
                     Text(session.title.isEmpty ? "Untitled" : session.title)
                         .font(.body.weight(.medium))
                     Spacer()
-                    Text(elapsedString(session: session))
-                        .font(.caption.monospacedDigit())
-                        .foregroundColor(.secondary)
+                    TimelineView(.periodic(from: .now, by: 1)) { ctx in
+                        Text(elapsedString(session: session, now: ctx.date))
+                            .font(.caption.monospacedDigit())
+                            .foregroundColor(.secondary)
+                    }
                 }
 
                 if !session.activity.isEmpty {
@@ -151,9 +153,9 @@ struct LiveView: View {
             .help("Status: \(status)")
     }
 
-    private func elapsedString(session: LiveSession) -> String {
+    private func elapsedString(session: LiveSession, now: Date = Date()) -> String {
         let referenceTime = session.turnStartedAt ?? session.startedAt
-        let elapsed = max(0, Int(Date().timeIntervalSince1970 - referenceTime))
+        let elapsed = max(0, Int(now.timeIntervalSince1970 - referenceTime))
         let minutes = elapsed / 60
         let seconds = elapsed % 60
         if minutes > 0 {

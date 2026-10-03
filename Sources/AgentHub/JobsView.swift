@@ -84,7 +84,7 @@ struct JobDetailView: View {
                 Divider()
                 
                 Text("Attempts (\(job.attempts.count))").font(.headline)
-                ForEach(job.attempts, id: \.result) { a in
+                ForEach(Array(job.attempts.enumerated()), id: \.offset) { _, a in
                     Text("\(a.harness)/\(a.model): \(a.result)")
                         .font(.caption)
                 }

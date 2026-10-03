@@ -5,6 +5,7 @@ struct MainWindow: View {
     @EnvironmentObject var engine: Engine
     @State private var selection: SidebarItem = .tree
     @State private var columns: NavigationSplitViewVisibility = .detailOnly
+    @State private var dismissedWarning: String?
     
     enum SidebarItem {
         case tree, live, dashboard, sessions, jobs, activity, models, harnesses, settings
@@ -29,13 +30,13 @@ struct MainWindow: View {
             }
         } detail: {
             VStack(spacing: 0) {
-                if let warning = engine.configWarning {
+                if let warning = engine.configWarning, warning != dismissedWarning {
                     HStack {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundColor(.yellow)
                         Text(warning)
                         Spacer()
-                        Button(action: { /* dismiss not possible on readonly var, maybe just show? wait, it says "shows engine.configWarning as a dismissible banner". But configWarning is readonly. I can use a local state. */ }) {
+                        Button(action: { dismissedWarning = warning }) {
                             Image(systemName: "xmark")
                         }
                     }
