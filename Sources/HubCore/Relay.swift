@@ -40,6 +40,7 @@ public struct Relay: Sendable {
             if let model = model { s.model = model }
             if let pid = pid { s.pid = pid }
             if event == "SessionEnd" { s.status = .ended }
+            else if s.status == .ended && event != "SessionStart" && event != "UserPromptSubmit" { }
             else if event == "Stop" { s.status = .idle }
             else { s.status = .working }
             try? FileStore.write(s, to: file)
@@ -53,6 +54,7 @@ public struct Relay: Sendable {
         var result: [MainSession] = []
         for file in files where file.pathExtension == "json" {
             guard let s = FileStore.read(MainSession.self, from: file) else { continue }
+            guard PolicyEngine.isEligibleSession(config: config, harness: s.harness, model: s.model, cwd: s.cwd) else { continue }
             if activeOnly {
                 if s.status == .ended || s.handedOff { continue }
                 if now.timeIntervalSince(s.lastSeen) > config.limits.activeSeconds { continue }
@@ -106,10 +108,11 @@ public struct Relay: Sendable {
 
     private func wrapUpText(harness: String, sid: String, target: ModelEntry?, reason: String, cwd: String) -> String {
         let hName = config.harness(harness)?.name ?? harness
+        let cause = reason.contains("global") ? "More than \(config.limits.maxMainSessions) main sessions are open" : "\(hName) usage is low"
         if let target = target {
-            return "\(hName) usage is low, so this session moves to \(target.name). Finish the current step only, write a handoff file (goal, done, in progress, next steps, files touched, gate command), then run: \(Proc.quote(ctlPath)) handoff --from \(harness) --session \(Proc.quote(sid)) --project \(Proc.quote(cwd)) --file <handoff file> and stop."
+            return "\(cause), so this session moves to \(target.name). Finish the current step only, write a handoff file (goal, done, in progress, next steps, files touched, gate command), then run: \(Proc.quote(ctlPath)) handoff --from \(harness) --session \(Proc.quote(sid)) --project \(Proc.quote(cwd)) --file <handoff file> and stop."
         } else {
-            return "\(hName) usage is low and no other main model has capacity; finish the current step, write the handoff file and stop."
+            return "\(cause) and no other main model has capacity; finish the current step, write the handoff file and stop."
         }
     }
 
@@ -117,36 +120,83 @@ public struct Relay: Sendable {
         if env[HubPaths.workerEnv] != nil { return nil }
         guard let sid = (payload["session_id"] ?? payload["thread_id"]) as? String else { return nil }
 
+        let sKey = FileStore.key(harness, sid)
+        let sFile = paths.sessions.appendingPathComponent("\(sKey).json")
+        let iFile = paths.inbox.appendingPathComponent("\(sKey).json")
+
+        let existing = FileStore.withLock(paths, "session-" + sKey) {
+            FileStore.read(MainSession.self, from: sFile)
+        }
+
         let cwd = payload["cwd"] as? String
         let model = payload["model"] as? String
         let pid = (payload["agent_pid"] as? NSNumber)?.int32Value ?? (payload["agent_pid"] as? String).flatMap { Int32($0) }
 
-        let session = touch(harness, sid, cwd: cwd, event: event, model: model, pid: pid, now: now)
+        let effectiveCwd = cwd ?? existing?.cwd ?? ""
+        let effectiveModel = model ?? existing?.model
+
+        guard PolicyEngine.isEligibleSession(config: config, harness: harness, model: effectiveModel, cwd: effectiveCwd) else {
+            return nil
+        }
+
+        let session = touch(harness, sid, cwd: effectiveCwd, event: event, model: effectiveModel, pid: pid, now: now)
 
         if event == "SessionStart" || event == "SessionEnd" {
-            Activity.log("session.event", harness: harness, model: model, ["event": event, "session": String(sid.prefix(8)), "project": URL(fileURLWithPath: session.cwd).lastPathComponent], paths: paths, now: now)
+            Activity.log("session.event", harness: harness, model: session.model, ["event": event, "session": String(sid.prefix(8)), "project": URL(fileURLWithPath: session.cwd).lastPathComponent], paths: paths, now: now)
             return nil
         }
 
         let snapshot = Snapshot(config: config, usage: measuredUsage(now: now), sessions: sessions(now: now), jobs: [], now: now)
-        let actions = PolicyEngine.rebalance(snapshot, alreadyWarned: Set(snapshot.sessions.compactMap { $0.warned != nil ? $0.id : nil }))
-        
-        if let action = actions.first(where: {
+        let actions = PolicyEngine.rebalance(snapshot, alreadyWarned: [])
+
+        let wrapUpAction = actions.first(where: {
             if case let .wrapUp(s, _, _) = $0 { return s.id == session.id }
             return false
-        }) {
-            if case let .wrapUp(_, target, reason) = action {
-                let pMsgs = pending(harness, sid)
-                if !pMsgs.contains(where: { $0.kind == .wrapUp }) {
-                    let text = wrapUpText(harness: harness, sid: sid, target: target, reason: reason, cwd: session.cwd)
+        })
+
+        if let wrapUpAction {
+            if case let .wrapUp(_, target, reason) = wrapUpAction {
+                var shouldSend = false
+                var sendCwd = session.cwd
+                FileStore.withLock(paths, "session-" + sKey) {
+                    var s = FileStore.read(MainSession.self, from: sFile) ?? session
+                    if s.warned == nil && !s.handedOff && s.status != .ended {
+                        s.warned = now
+                        try? FileStore.write(s, to: sFile)
+                        shouldSend = true
+                        sendCwd = s.cwd
+                    }
+                }
+                if shouldSend {
+                    let text = wrapUpText(harness: harness, sid: sid, target: target, reason: reason, cwd: sendCwd)
                     _ = try? send(harness, sid, text, kind: .wrapUp, now: now)
                     Activity.log("policy.wrapup", harness: harness, ["to": target?.id ?? "none"], paths: paths, now: now)
                 }
-                FileStore.withLock(paths, "session-" + FileStore.key(harness, sid)) {
-                    let file = paths.sessions.appendingPathComponent("\(FileStore.key(harness, sid)).json")
-                    if var s = FileStore.read(MainSession.self, from: file) {
-                        s.warned = now
-                        try? FileStore.write(s, to: file)
+            }
+        } else {
+            var hadWarned = false
+            FileStore.withLock(paths, "session-" + sKey) {
+                if var s = FileStore.read(MainSession.self, from: sFile) {
+                    if s.warned != nil {
+                        s.warned = nil
+                        try? FileStore.write(s, to: sFile)
+                        hadWarned = true
+                    }
+                }
+            }
+            if hadWarned {
+                FileStore.withLock(paths, "inbox-" + sKey) {
+                    var msgs = FileStore.read([InboxMessage].self, from: iFile) ?? []
+                    var changed = false
+                    for i in 0..<msgs.count where msgs[i].kind == .wrapUp {
+                        // Retire delivered ones too, or Stop keeps re-showing a stale wrap-up
+                        if msgs[i].done == nil {
+                            msgs[i].done = now
+                            changed = true
+                        }
+                    }
+                    if changed {
+                        try? FileStore.write(msgs, to: iFile)
                     }
                 }
             }
@@ -154,9 +204,14 @@ public struct Relay: Sendable {
 
         var output: [String: Any]? = nil
 
-        FileStore.withLock(paths, "inbox-" + FileStore.key(harness, sid)) {
-            let file = paths.inbox.appendingPathComponent("\(FileStore.key(harness, sid)).json")
-            var messages = FileStore.read([InboxMessage].self, from: file) ?? []
+        let isHandedOffOrEnded = FileStore.withLock(paths, "session-" + sKey) {
+            let s = FileStore.read(MainSession.self, from: sFile)
+            return s?.handedOff == true || s?.status == .ended
+        }
+        guard !isHandedOffOrEnded else { return nil }
+
+        FileStore.withLock(paths, "inbox-" + sKey) {
+            var messages = FileStore.read([InboxMessage].self, from: iFile) ?? []
             var toRender: [InboxMessage] = []
             var changed = false
 
@@ -191,7 +246,7 @@ public struct Relay: Sendable {
             }
 
             if changed {
-                try? FileStore.write(messages, to: file)
+                try? FileStore.write(messages, to: iFile)
             }
         }
 
@@ -228,15 +283,45 @@ public struct Relay: Sendable {
         let content = try String(contentsOfFile: resolvedFile, encoding: .utf8)
         try Secrets.assertClean([content])
 
+        // Count only eligible active main sessions and allow the source session to leave
+        var activeSessions = sessions(activeOnly: true, now: now)
+        if let sid = session {
+            activeSessions.removeAll { $0.sessionId == sid && $0.harness == harness }
+        } else {
+            if let idx = activeSessions.firstIndex(where: { $0.harness == harness }) {
+                activeSessions.remove(at: idx)
+            }
+        }
+
+        guard activeSessions.count < config.limits.maxMainSessions else {
+            let sessionList = activeSessions.map { s in
+                let m = s.model ?? "unknown"
+                let p = URL(fileURLWithPath: s.cwd).lastPathComponent
+                return "\(s.harness)/\(m)@\(p)"
+            }.joined(separator: ", ")
+            throw HubError.noCapacity("Global limit of \(config.limits.maxMainSessions) main sessions reached (\(activeSessions.count) active: \(sessionList))")
+        }
+
+        let snapshot = Snapshot(config: config, usage: measuredUsage(now: now), sessions: activeSessions, jobs: [], now: now)
+
         let target: ModelEntry
         if let mId = modelId {
             guard let m = config.model(mId) else { throw HubError.invalid("Target model not found") }
             guard m.isMain && m.enabled else { throw HubError.invalid("Target model is not a main model or is disabled") }
+            // Explicit target must honor capacity too
+            let check = PolicyEngine.canStartMain(snapshot, m.id)
+            guard check.ok else {
+                throw HubError.noCapacity(check.reason)
+            }
             target = m
         } else {
-            let snapshot = Snapshot(config: config, usage: measuredUsage(now: now), sessions: sessions(now: now), jobs: [], now: now)
             guard let best = PolicyEngine.bestMain(snapshot, excludingHarness: harness, planned: [:]) else {
-                throw HubError.noCapacity("No capacity for handoff")
+                let candidateHarnesses = config.harnesses.filter { h in
+                    h.id != harness && config.models.contains { $0.harness == h.id && $0.enabled && $0.isMain }
+                }
+                let list = candidateHarnesses.isEmpty ? config.harnesses.filter { $0.id != harness } : candidateHarnesses
+                let summary = list.map { "\($0.id): \(PolicyEngine.band(snapshot, $0.id))" }.joined(separator: ", ")
+                throw HubError.noCapacity("No other main model has capacity (\(summary))")
             }
             target = best
         }
@@ -332,20 +417,24 @@ public struct Relay: Sendable {
         for action in actions {
             switch action {
             case .wrapUp(let session, let target, let reason):
-                let pMsgs = pending(session.harness, session.sessionId)
-                if !pMsgs.contains(where: { $0.kind == .wrapUp }) {
-                    let text = wrapUpText(harness: session.harness, sid: session.sessionId, target: target, reason: reason, cwd: session.cwd)
+                let sKey = FileStore.key(session.harness, session.sessionId)
+                let sFile = paths.sessions.appendingPathComponent("\(sKey).json")
+                var shouldSend = false
+                var sendCwd = session.cwd
+                FileStore.withLock(paths, "session-" + sKey) {
+                    var s = FileStore.read(MainSession.self, from: sFile) ?? session
+                    if s.warned == nil && !s.handedOff && s.status != .ended {
+                        s.warned = now
+                        try? FileStore.write(s, to: sFile)
+                        shouldSend = true
+                        sendCwd = s.cwd
+                    }
+                }
+                if shouldSend {
+                    let text = wrapUpText(harness: session.harness, sid: session.sessionId, target: target, reason: reason, cwd: sendCwd)
                     _ = try? send(session.harness, session.sessionId, text, kind: .wrapUp, now: now)
                     Activity.log("policy.wrapup", harness: session.harness, ["to": target?.id ?? "none"], paths: paths, now: now)
                     logs.append("wrap-up: \(session.harness) session \(session.sessionId.prefix(8)) → \(target?.name ?? "no target") (\(reason))")
-
-                    FileStore.withLock(paths, "session-" + FileStore.key(session.harness, session.sessionId)) {
-                        let file = paths.sessions.appendingPathComponent("\(FileStore.key(session.harness, session.sessionId)).json")
-                        if var s = FileStore.read(MainSession.self, from: file) {
-                            s.warned = now
-                            try? FileStore.write(s, to: file)
-                        }
-                    }
                 }
             case .autoHandoff(let session, let target):
                 let text = autoHandoffText(session, now: now)

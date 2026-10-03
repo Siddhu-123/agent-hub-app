@@ -203,4 +203,58 @@ struct LiveFeedTests {
         _ = feed.handle(platform: "claude", event: "SessionStart", payload: [:], env: [:], pid: Int32.max)
         #expect(feed.sessions().isEmpty)
     }
+
+    @Test func testLiveFeedShowsNonMainModelsAndExcludesInternalPaths() throws {
+        let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let paths = HubPaths(root: root)
+
+        let feed = LiveFeed(paths: paths)
+        let now = Date()
+
+        // 1. Non-main model (e.g. claude-sonnet-4-6 which is not in config) still appears in LiveFeed
+        _ = feed.handle(platform: "claude", event: "UserPromptSubmit", payload: [
+            "session_id": "sid_live_sonnet",
+            "cwd": "/work/project",
+            "model": "claude-sonnet-4-6"
+        ], env: [:], pid: getpid(), now: now)
+
+        let sessions = feed.sessions(now: now)
+        #expect(sessions.contains { $0.sessionId == "sid_live_sonnet" && $0.model == "claude-sonnet-4-6" })
+
+        // 2. A session with cwd under ~/.codex or ~/.claude is excluded from LiveFeed and not recorded
+        let outBg = feed.handle(platform: "codex", event: "UserPromptSubmit", payload: [
+            "session_id": "sid_live_bg",
+            "cwd": "~/.codex/memories",
+            "model": "gpt-6.1-sol"
+        ], env: [:], pid: getpid(), now: now)
+        #expect(outBg == nil)
+
+        let fileBg = paths.live.appendingPathComponent("sessions/codex-sid_live_bg.json")
+        #expect(!FileManager.default.fileExists(atPath: fileBg.path))
+        #expect(!feed.sessions(now: now).contains { $0.sessionId == "sid_live_bg" })
+
+        // 3. Persisted session file with internal cwd is deleted on sessions()
+        let internalSession = LiveSession(
+            platform: "codex",
+            platformName: "Codex",
+            sessionId: "sid_disk_bg",
+            title: "Internal",
+            status: "idle",
+            activity: "",
+            app: "",
+            pid: nil,
+            steps: 0,
+            startedAt: now.timeIntervalSince1970,
+            updatedAt: now.timeIntervalSince1970,
+            cwd: "~/.codex/cache"
+        )
+        let diskBgFile = paths.live.appendingPathComponent("sessions/codex-sid_disk_bg.json")
+        try FileManager.default.createDirectory(at: paths.live.appendingPathComponent("sessions"), withIntermediateDirectories: true)
+        try JSONEncoder().encode(internalSession).write(to: diskBgFile)
+        #expect(FileManager.default.fileExists(atPath: diskBgFile.path))
+
+        let sessionsAfter = feed.sessions(now: now)
+        #expect(!sessionsAfter.contains { $0.sessionId == "sid_disk_bg" })
+        #expect(!FileManager.default.fileExists(atPath: diskBgFile.path))
+    }
 }

@@ -176,8 +176,13 @@ public struct LiveFeed: Sendable {
         }
     }
     public func sessions(now: Date = Date()) -> [LiveSession] {
-        files("sessions").compactMap { f in
+        return files("sessions").compactMap { f in
             guard let d = try? Data(contentsOf: f), let s = try? JSONDecoder().decode(LiveSession.self, from: d) else { return nil }
+            if PolicyEngine.isInternalBackgroundPath(s.cwd ?? "") {
+                try? FileManager.default.removeItem(at: f)
+                clear(s.platform, s.sessionId, passive: false)
+                return nil
+            }
             let age = now.timeIntervalSince1970 - s.updatedAt
             let dead = s.pid.map { $0 > 0 && kill(Int32(clamping: $0), 0) != 0 && errno == ESRCH } ?? false
             if dead || age > 86400 || (["done", "error"].contains(s.status) && age > 300) { try? FileManager.default.removeItem(at: f); clear(s.platform, s.sessionId, passive: false); return nil }
@@ -202,14 +207,29 @@ public struct LiveFeed: Sendable {
         try write(["platform": p, "lastEventAt": time, "lastEvent": e], url("platforms/\(p).json"))
         let sid = Self.text(Self.first(d, p == "opencode" ? ["sessionID"] : p == "antigravity" ? ["conversationId"] : ["session_id", "thread_id"]) ?? "default")
         let cwd = p == "antigravity" ? (d["workspacePaths"] as? [String])?.first ?? "" : Self.text(d[p == "opencode" ? "directory" : "cwd"])
-        let file = sessionFile(p, sid), project = Self.shortPath(cwd)
+        let file = sessionFile(p, sid)
+        let existing = read(file)
+
+        let effectiveCwd = !cwd.isEmpty ? cwd : (existing["cwd"] as? String ?? "")
+        let payloadModel = p == "antigravity" ? (d["modelName"] as? String) : (d["model"] as? String)
+        let effectiveModel = (payloadModel != nil && !payloadModel!.isEmpty) ? payloadModel : (existing["model"] as? String)
+
+        if PolicyEngine.isInternalBackgroundPath(effectiveCwd) {
+            return p == "antigravity" ? [:] : nil
+        }
+
+        let project = Self.shortPath(!effectiveCwd.isEmpty ? effectiveCwd : cwd)
         func update(_ fields: [String: Any]) throws {
             var s = read(file)
             if s.isEmpty {
                 s = ["platform": p, "platformName": Self.names[p]!, "sessionId": sid, "startedAt": time, "title": "", "status": "idle", "activity": "", "app": app, "pid": pid.map { Int($0) } ?? 0, "steps": 0]
+                if !effectiveCwd.isEmpty { s["cwd"] = effectiveCwd; s["project"] = project }
+                if let em = effectiveModel, !em.isEmpty { s["model"] = em }
                 Activity.log("live.session", harness: p, ["event": "start", "project": project], paths: paths, now: now)
             }
             for (k, v) in fields where !(v is NSNull) && (v as? String != "") { s[k] = v }
+            if !effectiveCwd.isEmpty && (s["cwd"] == nil || s["cwd"] as? String == "") { s["cwd"] = effectiveCwd; s["project"] = project }
+            if let em = effectiveModel, !em.isEmpty && (s["model"] == nil || s["model"] as? String == "") { s["model"] = em }
             if p == "claude" || p == "codex", let activity = fields["activity"] as? String {
                 var recent = (s["recent"] as? [[String: Any]] ?? []).compactMap { line -> LiveLine? in
                     guard let t = line["t"] as? Double, let text = line["text"] as? String else { return nil }
@@ -235,7 +255,7 @@ public struct LiveFeed: Sendable {
             try update(["status": "waiting", "activity": "Waiting for your answer"])
         }
         func permissionLog(_ tool: String, _ outcome: String) { Activity.log("live.permission", harness: p, ["tool": tool, "outcome": outcome], paths: paths, now: now) }
-        let context: [String: Any] = ["cwd": cwd, "project": project, "model": d["model"] ?? "", "transcript": d["transcript_path"] ?? ""]
+        let context: [String: Any] = ["cwd": effectiveCwd.isEmpty ? cwd : effectiveCwd, "project": project, "model": effectiveModel ?? d["model"] ?? "", "transcript": d["transcript_path"] ?? ""]
         if p == "claude" || p == "codex" {
             let tool = Self.text(d["tool_name"]), args = d["tool_input"] as? [String: Any] ?? [:]
             func saveAgents(_ agents: [LiveAgent]) throws {

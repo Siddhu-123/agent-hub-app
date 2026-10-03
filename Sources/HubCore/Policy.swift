@@ -228,7 +228,9 @@ public enum PolicyEngine {
         var droppedSessions: [MainSession] = []
         for harness in sessionMap.keys.sorted() {
             let sessions = sessionMap[harness] ?? []
-            let sorted = sessions.sorted { $0.lastSeen > $1.lastSeen }
+            // Keep the earliest-started sessions. `started` never changes on a hook, so the
+            // victim is stable; ordering by lastSeen made each hooking session look newest.
+            let sorted = sessions.sorted { ($0.started, $0.id) < ($1.started, $1.id) }
             let cap = sessionCap(s, harness)
             if cap > 0 {
                 let keep = min(sorted.count, cap)
@@ -250,7 +252,7 @@ public enum PolicyEngine {
             let aBand = band(s, a.harness).rawValue
             let bBand = band(s, b.harness).rawValue
             if aBand != bBand { return aBand < bBand }
-            return a.lastSeen < b.lastSeen
+            return (a.started, a.id) > (b.started, b.id)
         }
         
         while keptSessions.count > s.config.limits.maxMainSessions {
@@ -307,4 +309,42 @@ public enum PolicyEngine {
         }
         return lines
     }
+
+    public static func isInternalBackgroundPath(_ cwd: String) -> Bool {
+        let trimmed = cwd.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return false }
+
+        if trimmed == "~/.codex" || trimmed.hasPrefix("~/.codex/") ||
+           trimmed == "~/.claude" || trimmed.hasPrefix("~/.claude/") {
+            return true
+        }
+
+        let homePaths = [
+            FileManager.default.homeDirectoryForCurrentUser.path,
+            NSHomeDirectory()
+        ]
+
+        let expanded = (trimmed as NSString).expandingTildeInPath
+        let std = (expanded as NSString).standardizingPath
+
+        for home in homePaths {
+            let stdHome = (home as NSString).standardizingPath
+            let codexDir = (stdHome as NSString).appendingPathComponent(".codex")
+            let claudeDir = (stdHome as NSString).appendingPathComponent(".claude")
+
+            if std == codexDir || std.hasPrefix(codexDir + "/") { return true }
+            if std == claudeDir || std.hasPrefix(claudeDir + "/") { return true }
+        }
+        return false
+    }
+
+    public static func isEligibleMainModel(config: AppConfig, harness: String, model: String?) -> Bool {
+        config.isEligibleMainModel(harness: harness, model: model)
+    }
+
+    public static func isEligibleSession(config: AppConfig, harness: String, model: String?, cwd: String) -> Bool {
+        if isInternalBackgroundPath(cwd) { return false }
+        return isEligibleMainModel(config: config, harness: harness, model: model)
+    }
 }
+

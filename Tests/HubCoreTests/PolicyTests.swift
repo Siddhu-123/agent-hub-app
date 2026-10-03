@@ -187,7 +187,7 @@ import Foundation
         let now = Date()
         var s = Snapshot(config: makeConfig(), usage: [:], sessions: [], jobs: [], now: now)
         
-        // codex at 0.25 with two sessions keeps the most recent and wraps up the other targeting the claude main
+        // codex at 0.25 with two sessions keeps the earliest-started and wraps up the newer one targeting the claude main
         s.usage["codex"] = UsageReading(left: 0.25, source: "")
         s.sessions.append(MainSession(harness: "codex", sessionId: "old", cwd: "", started: now.addingTimeInterval(-100), lastSeen: now.addingTimeInterval(-100), lastEvent: "", status: .working))
         s.sessions.append(MainSession(harness: "codex", sessionId: "new", cwd: "", started: now.addingTimeInterval(-10), lastSeen: now.addingTimeInterval(-10), lastEvent: "", status: .working))
@@ -195,7 +195,7 @@ import Foundation
         let actions1 = PolicyEngine.rebalance(s, alreadyWarned: [])
         #expect(actions1.count == 1)
         if case .wrapUp(let session, let target, _) = actions1[0] {
-            #expect(session.sessionId == "old")
+            #expect(session.sessionId == "new")
             #expect(target?.harness == "claude")
         } else {
             Issue.record("Expected wrapUp")
@@ -223,14 +223,24 @@ import Foundation
         let actions3 = PolicyEngine.rebalance(s, alreadyWarned: [])
         #expect(actions3.count == 1)
         if case .wrapUp(let session, _, _) = actions3[0] {
-            #expect(session.sessionId == "c1") // oldest
+            #expect(session.sessionId == "c2") // newest-started is over capacity
         } else {
             Issue.record("Expected wrapUp")
         }
         
         // already-warned sessions are not warned again
-        let actions4 = PolicyEngine.rebalance(s, alreadyWarned: ["claude-c1"])
-        #expect(actions4.isEmpty) // wait, since "claude-c1" is already warned, it should skip it. Then it's down to 2 sessions? No, keptSessions is 3, c1 is dropped. But c1 is warned. What happens to cd1? It's kept! Because we only wrap up `keptSessions.count - maxMainSessions` (1 item).
+        let actions4 = PolicyEngine.rebalance(s, alreadyWarned: ["claude-c2"])
+        #expect(actions4.isEmpty) // c2 is skipped, and only one session is over capacity
+
+        // the victim stays the newest-started session even after the older one fires a hook
+        s.sessions[0].lastSeen = now
+        let stableActions = PolicyEngine.rebalance(s, alreadyWarned: [])
+        #expect(stableActions.count == 1)
+        if case .wrapUp(let session, _, _) = stableActions.first {
+            #expect(session.sessionId == "c2")
+        } else {
+            Issue.record("Expected wrapUp")
+        }
         
         // autoHandoff only when exhausted AND grace elapsed AND a target exists
         s.sessions.removeAll()

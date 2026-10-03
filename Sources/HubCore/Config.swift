@@ -182,3 +182,13 @@ public enum ConfigStore {
         c.mainOrder.append(entry.id)
     }
 }
+
+extension AppConfig {
+    public func isEligibleMainModel(harness: String, model: String?) -> Bool {
+        guard let model = model, !model.isEmpty else {
+            return models.contains { $0.harness == harness && $0.enabled && $0.isMain }
+        }
+        guard let entry = self.model(model) else { return false }
+        return entry.harness == harness && entry.enabled && entry.isMain
+    }
+}
