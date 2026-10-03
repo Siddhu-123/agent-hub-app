@@ -2,7 +2,164 @@ import SwiftUI
 import AppKit
 import HubCore
 
-/// Polls the live feed, the job store and the job logs once a second and builds the session trees.
+struct Pulse: Equatable, Sendable {
+    var launched: Date
+    var duration: Double
+    var weight: Double
+}
+
+struct TreeCache: Sendable {
+    struct Chat: Sendable {
+        var url: URL?
+        var hint: String?
+        var located = Date.distantPast
+        var size: Int?
+        var modified: Date?
+        var entries: [ChatEntry] = []
+    }
+    var transcripts: [String: Chat] = [:]
+    var bytes: [String: Int] = [:]
+    var averages: [String: Double] = [:]
+}
+
+struct TreeSnapshot: Sendable {
+    var roots: [HubNode]
+    var tails: [String: [String]]
+    var sessions: [String: LiveSession]
+    var jobs: [String: Job]
+    var chats: [String: [ChatEntry]]
+    var fullChats: [String: [ChatEntry]]
+    var flows: [String: [Pulse]]
+    var detail: String
+    var cache: TreeCache
+}
+
+/// File reads and flow sampling stay on the refresh queue; caches travel by value.
+enum TreeReader {
+    static func read(paths: HubPaths, modelHarness: [String: String], detailId: String?,
+                     cache: TreeCache, flows: [String: [Pulse]], now: Date) -> TreeSnapshot {
+        var cache = cache
+        let live = LiveFeed(paths: paths).sessions(now: now).filter { !$0.isUnpromptedIdle(at: now) }
+        let all = JobStore(paths: paths).all()
+        var roots = HubTree.build(sessions: live, jobs: all, modelHarness: modelHarness, now: now)
+        let sessions = Dictionary(live.map { ("s:\($0.platform):\($0.sessionId)", $0) }, uniquingKeysWith: { a, _ in a })
+        let jobs = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        var chats: [String: [ChatEntry]] = [:], fullChats: [String: [ChatEntry]] = [:]
+        var tails: [String: [String]] = [:], stages: [String: HubNode.Role] = [:]
+        var sizes: [String: Int] = [:], sources: [String: String] = [:]
+        var jobIds = Set<String>()
+        func findJobs(_ node: HubNode) {
+            if let id = node.jobId { jobIds.insert(id) }
+            node.children.forEach(findJobs)
+        }
+        roots.forEach(findJobs)
+        for id in jobIds {
+            let url = JobLog.url(paths, id)
+            let log = JobLog.tail(paths, id, maxBytes: 6_000)
+            tails[id] = TreeModel.lines(log, keep: 40)
+            sizes[url.path] = fileSize(url)
+            stages[id] = activeStage(log)
+        }
+        let rootIds = Set(roots.map(\.id))
+        cache.transcripts = cache.transcripts.filter { rootIds.contains($0.key) }
+        for root in roots {
+            guard let session = sessions[root.id] else { continue }
+            var chat = cache.transcripts[root.id] ?? TreeCache.Chat()
+            if chat.hint != session.transcript {
+                chat = TreeCache.Chat(hint: session.transcript)
+            }
+            if chat.url == nil && now.timeIntervalSince(chat.located) >= 10 {
+                chat.url = Transcript.locate(platform: session.platform, sessionId: session.sessionId, hint: session.transcript)
+                chat.located = now
+            }
+            if let url = chat.url {
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+                   let size = attrs[.size] as? Int, let modified = attrs[.modificationDate] as? Date {
+                    if chat.size != size || chat.modified != modified {
+                        chat.entries = Array(Transcript.entries(url).suffix(400))
+                        chat.size = size
+                        chat.modified = modified
+                    }
+                    sizes[url.path] = size
+                    sources[root.id] = url.path
+                } else {
+                    chat.url = nil; chat.size = nil; chat.modified = nil; chat.entries = []
+                }
+            }
+            chats[root.id] = Array(chat.entries.suffix(40))
+            fullChats[root.id] = chat.entries
+            cache.transcripts[root.id] = chat
+        }
+        func decorate(_ original: HubNode, parentSession: String?, jobId: String?) -> HubNode {
+            var node = original
+            let sessionId = node.role == .main ? node.id : parentSession
+            let jobId = node.jobId ?? jobId
+            if let jobId, [.worker, .broker, .check].contains(node.role) {
+                node.jobId = jobId
+                let running = jobs[jobId]?.state == .running
+                node.active = running && node.role == (stages[jobId] ?? .worker)
+                if node.role != .worker && running {
+                    node.status = node.active ? "running" : "pending"
+                }
+                sources[node.id] = JobLog.url(paths, jobId).path
+            } else if node.role == .subagent, let sessionId, let source = sources[sessionId] {
+                sources[node.id] = source
+            }
+            node.children = node.children.map { decorate($0, parentSession: sessionId, jobId: jobId) }
+            return node
+        }
+        roots = roots.map { decorate($0, parentSession: nil, jobId: nil) }
+        var nextFlows: [String: [Pulse]] = [:]
+        var seen = Set<String>()
+        func sample(_ node: HubNode) {
+            seen.insert(node.id)
+            var pulses = (flows[node.id] ?? []).filter { $0.launched.addingTimeInterval($0.duration) > now }
+            if node.active, let source = sources[node.id], let size = sizes[source], let previous = cache.bytes[source], size > previous {
+                let tokens = Double(size - previous) / 4
+                let n = ceil(tokens)
+                let average = cache.averages[node.id].map { 0.7 * $0 + 0.3 * n } ?? n
+                cache.averages[node.id] = average
+                let ratio = n / average
+                let weight = min(1.5, max(0.5, ratio))
+                let duration = 1.6 / min(1.5, max(0.75, ratio))
+                let count = min(6, max(1, Int(ceil(n / 60))))
+                for i in 0..<count {
+                    pulses.append(Pulse(launched: now.addingTimeInterval(Double(i) / Double(count)), duration: duration, weight: weight))
+                }
+            }
+            if !pulses.isEmpty { nextFlows[node.id] = pulses }
+            node.children.forEach(sample)
+        }
+        roots.forEach(sample)
+        cache.bytes = sizes
+        cache.averages = cache.averages.filter { seen.contains($0.key) }
+        let selectedJob = detailId.flatMap { id in
+            id.hasPrefix("s:") || id.hasPrefix("a:") ? nil : id.split(separator: ":", maxSplits: 1).last.map(String.init)
+        }
+        let detail = selectedJob.flatMap { id in
+            jobs[id].map { _ in TreeModel.readable(JobLog.tail(paths, id, maxBytes: 96_000)) }
+        } ?? ""
+        return TreeSnapshot(roots: roots, tails: tails, sessions: sessions, jobs: jobs, chats: chats,
+                            fullChats: fullChats, flows: nextFlows, detail: detail, cache: cache)
+    }
+
+    private static func fileSize(_ url: URL) -> Int? {
+        (try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? Int
+    }
+
+    private static func activeStage(_ log: String) -> HubNode.Role? {
+        var role: HubNode.Role? = .worker
+        for line in log.split(separator: "\n") where line.hasPrefix("── ") && line.hasSuffix(" ──") {
+            let stage = line.dropFirst(3).dropLast(3)
+            if stage.hasPrefix("MASK ") || stage.hasPrefix("DECODE ") { role = .broker }
+            else if stage.hasPrefix("HEAVY ") || stage.hasPrefix("worker ") { role = .worker }
+            else if stage.hasPrefix("check ") || stage.hasPrefix("masked check ") { role = .check }
+        }
+        return role
+    }
+}
+
+/// Polls live sessions, transcripts and job logs once a second.
 @MainActor
 final class TreeModel: ObservableObject {
     @Published private(set) var roots: [HubNode] = []
@@ -10,18 +167,22 @@ final class TreeModel: ObservableObject {
     @Published private(set) var sessions: [String: LiveSession] = [:]
     @Published private(set) var jobs: [String: Job] = [:]
     @Published private(set) var detail = ""
+    @Published private(set) var chats: [String: [ChatEntry]] = [:]
+    @Published private(set) var fullChats: [String: [ChatEntry]] = [:]
+    @Published private(set) var flows: [String: [Pulse]] = [:]
+    @Published private(set) var dispatching: Set<String> = []
     /// When each node was first seen active; drives the dispatch flash.
     private(set) var firstActive: [String: Date] = [:]
     var detailId: String?
     private var timer: Timer?
     private var loading = false
     private var loadedOnce = false
+    private var cache = TreeCache()
 
     func start(paths: HubPaths, modelHarness: @escaping @MainActor () -> [String: String]) {
         guard timer == nil else { return }
         refresh(paths: paths, modelHarness: modelHarness())
         let t = Timer(timeInterval: 1, repeats: true) { [weak self] t in
-            // Stops itself if the model went away without onDisappear.
             guard self != nil else { t.invalidate(); return }
             Task { @MainActor in self?.refresh(paths: paths, modelHarness: modelHarness()) }
         }
@@ -34,30 +195,23 @@ final class TreeModel: ObservableObject {
     private func refresh(paths: HubPaths, modelHarness: [String: String]) {
         guard !loading else { return }
         loading = true
-        let detailId = self.detailId
+        let detailId = self.detailId, cache = self.cache, flows = self.flows
         DispatchQueue.global(qos: .userInitiated).async {
             let now = Date()
-            let live = LiveFeed(paths: paths).sessions(now: now)
-            let all = JobStore(paths: paths).all()
-            let roots = HubTree.build(sessions: live, jobs: all, modelHarness: modelHarness, now: now)
-            var tails: [String: [String]] = [:]
-            func walk(_ n: HubNode) {
-                if n.role == .worker, let id = n.jobId { tails[id] = TreeModel.lines(JobLog.tail(paths, id, maxBytes: 6_000), keep: 40) }
-                n.children.forEach(walk)
-            }
-            roots.forEach(walk)
-            var detail = ""
-            if let detailId, detailId.hasPrefix("j:") { detail = TreeModel.readable(JobLog.tail(paths, String(detailId.dropFirst(2)), maxBytes: 96_000)) }
-            let sessions = Dictionary(live.map { ("s:\($0.platform):\($0.sessionId)", $0) }, uniquingKeysWith: { a, _ in a })
-            let jobs = Dictionary(all.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+            let result = TreeReader.read(paths: paths, modelHarness: modelHarness, detailId: detailId,
+                                         cache: cache, flows: flows, now: now)
             Task { @MainActor in
                 self.loading = false
-                self.track(roots, now: now)
-                if self.roots != roots { self.roots = roots }
-                if self.tails != tails { self.tails = tails }
-                self.sessions = sessions
-                self.jobs = jobs
-                if self.detail != detail { self.detail = detail }
+                self.track(result.roots, now: now)
+                self.cache = result.cache
+                if self.roots != result.roots { self.roots = result.roots }
+                if self.tails != result.tails { self.tails = result.tails }
+                if self.sessions != result.sessions { self.sessions = result.sessions }
+                if self.jobs != result.jobs { self.jobs = result.jobs }
+                if self.detail != result.detail { self.detail = result.detail }
+                if self.chats != result.chats { self.chats = result.chats }
+                if self.fullChats != result.fullChats { self.fullChats = result.fullChats }
+                if self.flows != result.flows { self.flows = result.flows }
             }
         }
     }
@@ -74,6 +228,8 @@ final class TreeModel: ObservableObject {
         }
         roots.forEach(walk)
         firstActive = firstActive.filter { seen.contains($0.key) }
+        let dispatching = Set(firstActive.filter { now.timeIntervalSince($0.value) < 1.6 }.keys)
+        if self.dispatching != dispatching { self.dispatching = dispatching }
         loadedOnce = true
     }
 
@@ -146,7 +302,7 @@ enum TreeLayout {
 
     static func size(_ role: HubNode.Role) -> CGSize {
         switch role {
-        case .main: return CGSize(width: 400, height: 250)
+        case .main: return CGSize(width: 460, height: 340)
         case .subagent: return CGSize(width: 300, height: 196)
         case .worker: return CGSize(width: 340, height: 230)
         case .broker: return CGSize(width: 230, height: 112)
@@ -361,10 +517,10 @@ struct TreeView: View {
         let scale = zoom * pinch
         return ScrollView([.horizontal, .vertical]) {
             ZStack(alignment: .topLeading) {
-                Connectors(nodes: layout.nodes, firstActive: model.firstActive)
+                Connectors(nodes: layout.nodes, firstActive: model.firstActive, model: model)
                     .frame(width: layout.size.width, height: layout.size.height)
                 ForEach(layout.nodes) { p in
-                    NodeCard(node: p.node, lines: lines(p.node), selected: selected == p.node.id)
+                    NodeCard(node: p.node, chat: model.chats[p.node.id], lines: lines(p.node), selected: selected == p.node.id)
                         .frame(width: p.frame.width, height: p.frame.height)
                         .position(x: p.frame.midX, y: p.frame.midY)
                         .onTapGesture {
@@ -449,9 +605,16 @@ struct TreeBackground: View {
 struct Connectors: View {
     let nodes: [PlacedNode]
     let firstActive: [String: Date]
+    @ObservedObject var model: TreeModel
 
     private var animating: Bool {
-        nodes.contains { $0.parent != nil && ($0.node.active || ["running", "working"].contains($0.node.status)) }
+        let now = Date()
+        return nodes.contains { placed in
+            guard placed.parent != nil else { return false }
+            let dispatching = placed.node.active && model.dispatching.contains(placed.node.id)
+            let pulses = model.flows[placed.node.id] ?? []
+            return dispatching || pulses.contains { $0.launched.addingTimeInterval($0.duration) > now }
+        }
     }
 
     var body: some View {
@@ -478,31 +641,37 @@ struct Connectors: View {
 
         let color = node.role.color
         let failed = ["failed", "error", "needs_review", "blocked"].contains(node.status)
-        guard node.active else {
+        let pulses = (model.flows[node.id] ?? []).filter { now >= $0.launched && now < $0.launched.addingTimeInterval($0.duration) }
+        guard node.active || !pulses.isEmpty else {
             ctx.stroke(path, with: .color(failed ? Color.red.opacity(0.45) : Color.secondary.opacity(0.35)),
                        style: StrokeStyle(lineWidth: 1.6, lineCap: .round, dash: node.status == "queued" ? [5, 6] : []))
-            // Socket dots at both ends.
             for q in [p0, p3] { ctx.fill(Path(ellipseIn: CGRect(x: q.x - 3, y: q.y - 3, width: 6, height: 6)), with: .color(.secondary.opacity(0.5))) }
             return
         }
 
-        // Live wire: glow, core and marching current.
+        let hasPulses = !pulses.isEmpty
+
         ctx.drawLayer { g in
             g.addFilter(.blur(radius: 5))
             g.stroke(path, with: .color(color.opacity(0.55)), lineWidth: 7)
         }
         ctx.stroke(path, with: .color(color.opacity(0.85)), lineWidth: 2.2)
-        ctx.stroke(path, with: .color(.white.opacity(0.75)),
-                   style: StrokeStyle(lineWidth: 1.4, lineCap: .round, dash: [3, 13], dashPhase: CGFloat(-t * 46)))
 
-        // Packets travelling from parent to child.
-        let packets = 3
-        for k in 0..<packets {
-            let u = (t * 0.42 + Double(k) / Double(packets)).truncatingRemainder(dividingBy: 1)
-            packet(&ctx, at: u, p0, p1, p2, p3, color: color, size: 1)
+        if hasPulses {
+            let speed = CGFloat(pulses.count) * 46
+            ctx.stroke(path, with: .color(.white.opacity(0.75)),
+                       style: StrokeStyle(lineWidth: 1.4, lineCap: .round, dash: [3, 13], dashPhase: CGFloat(-t * Double(speed))))
         }
 
-        // A freshly dispatched task: a bright comet runs down the wire once.
+        for pulse in pulses {
+            let elapsed = now.timeIntervalSince(pulse.launched)
+            let u = elapsed / pulse.duration
+            if u >= 0 && u < 1 {
+                let smoothed = smoothstep(min(1, max(0, u)))
+                packet(&ctx, at: Double(smoothed), p0, p1, p2, p3, color: color, size: 1, weight: pulse.weight)
+            }
+        }
+
         if let first = firstActive[node.id] {
             let age = now.timeIntervalSince(first)
             if age >= 0 && age < 1.6 {
@@ -512,7 +681,7 @@ struct Connectors: View {
                     let c = bezier(u, p0, p1, p2, p3)
                     g.fill(Path(ellipseIn: CGRect(x: c.x - 14, y: c.y - 14, width: 28, height: 28)), with: .color(color))
                 }
-                packet(&ctx, at: u, p0, p1, p2, p3, color: .white, size: 1.6)
+                packet(&ctx, at: u, p0, p1, p2, p3, color: .white, size: 1.6, weight: 1)
                 if age > 1.0 {
                     let r = CGFloat((age - 1.0) / 0.6) * 46
                     ctx.stroke(Path(ellipseIn: CGRect(x: p3.x - r, y: p3.y - r, width: r * 2, height: r * 2)),
@@ -526,20 +695,27 @@ struct Connectors: View {
         }
     }
 
-    private func packet(_ ctx: inout GraphicsContext, at u: Double, _ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, color: Color, size s: CGFloat) {
+    private func packet(_ ctx: inout GraphicsContext, at u: Double, _ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint, color: Color, size s: CGFloat, weight: Double = 1) {
         let c = bezier(u, p0, p1, p2, p3), d = tangent(u, p0, p1, p2, p3)
         let fade = min(1, min(u, 1 - u) * 8)
+        let flowRange = 0.2
+        let scale = 1 + flowRange * (weight - 1)
         var g = ctx
-        g.opacity = fade
+        g.opacity = fade * 0.85 * scale
         g.translateBy(x: c.x, y: c.y)
         g.rotate(by: .radians(atan2(d.y, d.x)))
-        let r = CGRect(x: -6 * s, y: -4 * s, width: 12 * s, height: 8 * s)
+        let r = CGRect(x: -6 * s * scale, y: -4 * s * scale, width: 12 * s * scale, height: 8 * s * scale)
         g.drawLayer { l in
             l.addFilter(.blur(radius: 4))
             l.fill(Path(roundedRect: r.insetBy(dx: -2, dy: -2), cornerRadius: 3), with: .color(color))
         }
         g.fill(Path(roundedRect: r, cornerRadius: 2.5), with: .color(color))
-        g.fill(Path(roundedRect: r.insetBy(dx: 3 * s, dy: 2.4 * s), cornerRadius: 1), with: .color(.white.opacity(0.9)))
+        g.fill(Path(roundedRect: r.insetBy(dx: 3 * s * scale, dy: 2.4 * s * scale), cornerRadius: 1), with: .color(.white.opacity(0.9)))
+    }
+
+    private func smoothstep(_ t: Double) -> Double {
+        let t = max(0, min(1, t))
+        return t * t * (3 - 2 * t)
     }
 
     private func bezier(_ t: Double, _ p0: CGPoint, _ p1: CGPoint, _ p2: CGPoint, _ p3: CGPoint) -> CGPoint {
@@ -560,6 +736,7 @@ struct Connectors: View {
 
 struct NodeCard: View {
     let node: HubNode
+    let chat: [ChatEntry]?
     let lines: [String]
     let selected: Bool
 
@@ -576,7 +753,11 @@ struct NodeCard: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(.horizontal, 10).padding(.vertical, 7)
-            TerminalPane(lines: shownLines, live: live, placeholder: placeholder)
+            if node.role == .main, let chat = chat, !chat.isEmpty {
+                ChatPane(entries: chat, live: live)
+            } else {
+                TerminalPane(lines: shownLines, live: live, placeholder: placeholder)
+            }
         }
         .background(RoundedRectangle(cornerRadius: 11).fill(Color(nsColor: .controlBackgroundColor)))
         .clipShape(RoundedRectangle(cornerRadius: 11))
@@ -626,6 +807,51 @@ struct NodeCard: View {
         .padding(.horizontal, 9)
         .frame(height: 26)
         .background(node.role.color.opacity(0.10))
+    }
+}
+
+struct ChatPane: View {
+    let entries: [ChatEntry]
+    let live: Bool
+
+    var body: some View {
+        GeometryReader { geo in
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(Array(entries.enumerated()), id: \.offset) { _, entry in
+                    Text(entryText(entry))
+                        .lineLimit(nil)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                if live { Cursor() }
+            }
+            .font(.system(size: 10, design: .monospaced))
+            .frame(width: max(0, geo.size.width - 18), alignment: .leading)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.horizontal, 9).padding(.vertical, 7)
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .bottomLeading)
+        }
+        .background(Color(red: 0.06, green: 0.07, blue: 0.09))
+        .clipped()
+    }
+
+    private func entryText(_ entry: ChatEntry) -> AttributedString {
+        switch entry.role {
+        case .user:
+            var a = AttributedString("you › ")
+            a.foregroundColor = Color.accentColor
+            var text = AttributedString(entry.text)
+            text.foregroundColor = Color.accentColor
+            a.append(text)
+            return a
+        case .assistant:
+            var a = AttributedString(entry.text)
+            a.foregroundColor = Color.white.opacity(0.82)
+            return a
+        case .tool:
+            var a = AttributedString("· " + entry.text)
+            a.foregroundColor = Color.white.opacity(0.45)
+            return a
+        }
     }
 }
 
@@ -745,12 +971,12 @@ struct DetailDrawer: View {
     }
 
     private var job: Job? { node.jobId.flatMap { model.jobs[$0] } }
+    private var chat: [ChatEntry] { model.fullChats[node.id] ?? [] }
 
     private var header: String {
         switch node.role {
         case .main:
-            let s = model.sessions[node.id]
-            return [s?.cwd, s?.lastPrompt.map { "Prompt: \($0)" }].compactMap { $0 }.joined(separator: "\n")
+            return model.sessions[node.id]?.cwd ?? ""
         case .worker, .broker, .check:
             guard let job else { return node.subtitle }
             return "\(job.objective)\nFiles: \(job.allowedFiles.joined(separator: ", "))  ·  Check: \(job.checkArgv.joined(separator: " "))"
@@ -774,6 +1000,16 @@ struct DetailDrawer: View {
             if let note = job.note { out.append("Note: \(note)") }
             return out.isEmpty ? "Waiting for the gate." : out.joined(separator: "\n")
         case .main:
+            if !chat.isEmpty {
+                let modelId = model.sessions[node.id]?.model ?? node.title
+                return chat.map { entry in
+                    switch entry.role {
+                    case .user: return "YOU › " + entry.text
+                    case .assistant: return modelId + "\n" + entry.text
+                    case .tool: return "tool\n· " + entry.text
+                    }
+                }.joined(separator: "\n\n")
+            }
             let f = DateFormatter(); f.dateFormat = "HH:mm:ss"
             let recent = model.sessions[node.id]?.recent ?? []
             return recent.isEmpty ? node.lines.joined(separator: "\n") : recent.map { "\(f.string(from: Date(timeIntervalSince1970: $0.t)))  \($0.text)" }.joined(separator: "\n")
@@ -787,13 +1023,39 @@ struct DetailDrawer: View {
 
     private func colored(_ text: String) -> AttributedString {
         var out = AttributedString()
-        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
-            var a = AttributedString(String(line) + "\n")
-            let lower = line.lowercased()
-            if line.hasPrefix("──") { a.foregroundColor = Color(red: 0.45, green: 0.85, blue: 1.0) }
-            else if lower.contains("error") || lower.contains("fail") { a.foregroundColor = Color(red: 1.0, green: 0.45, blue: 0.42) }
-            else { a.foregroundColor = Color.white.opacity(0.85) }
-            out.append(a)
+        if node.role == .main && !chat.isEmpty {
+            let modelId = model.sessions[node.id]?.model ?? node.title
+            for entry in chat {
+                switch entry.role {
+                case .user:
+                    var a = AttributedString("YOU › ")
+                    a.foregroundColor = Color.accentColor
+                    out.append(a)
+                    var body = AttributedString(entry.text + "\n\n")
+                    body.foregroundColor = Color.white.opacity(0.85)
+                    out.append(body)
+                case .assistant:
+                    var a = AttributedString(modelId + "\n")
+                    a.foregroundColor = Color.white.opacity(0.85)
+                    out.append(a)
+                    var body = AttributedString(entry.text + "\n\n")
+                    body.foregroundColor = Color.white.opacity(0.85)
+                    out.append(body)
+                case .tool:
+                    var a = AttributedString("tool\n· " + entry.text + "\n")
+                    a.foregroundColor = Color.white.opacity(0.45)
+                    out.append(a)
+                }
+            }
+        } else {
+            for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+                var a = AttributedString(String(line) + "\n")
+                let lower = line.lowercased()
+                if line.hasPrefix("──") { a.foregroundColor = Color(red: 0.45, green: 0.85, blue: 1.0) }
+                else if lower.contains("error") || lower.contains("fail") { a.foregroundColor = Color(red: 1.0, green: 0.45, blue: 0.42) }
+                else { a.foregroundColor = Color.white.opacity(0.85) }
+                out.append(a)
+            }
         }
         return out
     }

@@ -457,6 +457,7 @@ public final class Runner: @unchecked Sendable {
             // The check may run files the untrusted worker edited, so it runs in the same sandbox.
             var checkEnv = stage?.env ?? ProcessInfo.processInfo.environment
             checkEnv["PWD"] = filesDir
+            JobLog.mark(paths, j.id, "masked check \(checkArgv.joined(separator: " "))")
             let checkRes = exec(Sandbox.wrap(checkArgv), filesDir, checkEnv, nil, 600, { pid in
                 self.lock.lock()
                 self.pids[j.id] = pid

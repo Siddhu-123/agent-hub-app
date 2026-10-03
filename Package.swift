@@ -14,5 +14,6 @@ let package = Package(
         .executableTarget(name: "agenthubctl", dependencies: ["HubCore"]),
         .executableTarget(name: "AgentHub", dependencies: ["HubCore"]),
         .testTarget(name: "HubCoreTests", dependencies: ["HubCore"]),
+        .testTarget(name: "AgentHubTests", dependencies: ["AgentHub"]),
     ]
 )

@@ -18,7 +18,7 @@ public struct LiveAgent: Codable, Equatable, Sendable {
     }
 }
 
-public struct LiveSession: Codable, Sendable {
+public struct LiveSession: Codable, Equatable, Sendable {
     public var platform, platformName, sessionId, title, status, activity, app: String
     public var pid: Int?
     public var steps: Int

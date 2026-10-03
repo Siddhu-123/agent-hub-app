@@ -1,6 +1,12 @@
 import SwiftUI
 import HubCore
 
+extension LiveSession {
+    func isUnpromptedIdle(at now: Date) -> Bool {
+        steps == 0 && (lastPrompt?.isEmpty ?? true) && status == "idle" && now.timeIntervalSince1970 - updatedAt > 120
+    }
+}
+
 struct LiveView: View {
     @EnvironmentObject var engine: Engine
 
@@ -12,6 +18,14 @@ struct LiveView: View {
     ]
 
     var body: some View {
+        TimelineView(.periodic(from: .now, by: 2)) { context in
+            content(now: context.date)
+        }
+    }
+
+    @ViewBuilder
+    private func content(now: Date) -> some View {
+        let visibleSessions = engine.liveSessions.filter { !$0.isUnpromptedIdle(at: now) }
         ScrollView {
             VStack(alignment: .leading, spacing: 16) {
                 if !engine.liveRequests.isEmpty {
@@ -25,12 +39,12 @@ struct LiveView: View {
                     .padding(.bottom, 8)
                 }
 
-                if engine.liveSessions.isEmpty {
+                if visibleSessions.isEmpty {
                     ContentUnavailableView("No agent sessions right now", systemImage: "dot.radiowaves.left.and.right")
                         .padding(.top, 40)
                 } else {
                     ForEach(harnesses, id: \.key) { harness in
-                        let sessions = engine.liveSessions.filter { $0.platform == harness.key }
+                        let sessions = visibleSessions.filter { $0.platform == harness.key }
                         if !sessions.isEmpty {
                             VStack(alignment: .leading, spacing: 8) {
                                 Text(harness.name)
