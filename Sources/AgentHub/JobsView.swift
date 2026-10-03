@@ -58,6 +58,7 @@ struct JobsView: View {
                 }
                 .padding()
             }
+            .frame(minWidth: 450, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
             
             if let sel = selection, let j = engine.jobs.first(where: { $0.id == sel }) {
                 JobDetailView(job: j)
@@ -67,6 +68,7 @@ struct JobsView: View {
                     .frame(minWidth: 250)
             }
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .errorAlert(error: $error)
         .sheet(isPresented: $isNewJob) {
             NewJobSheet(isPresented: $isNewJob)
