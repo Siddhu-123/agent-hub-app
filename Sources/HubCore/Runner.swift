@@ -10,7 +10,7 @@ public final class Runner: @unchecked Sendable {
         set { lock.lock(); _config = newValue; lock.unlock() }
     }
     
-    public typealias Exec = ([String], String?, [String: String]?, String?, TimeInterval, @escaping (Int32) -> Void) -> CheckResult
+    public typealias Exec = ([String], String?, [String: String]?, String?, TimeInterval, @escaping (Int32) -> Void, @escaping (Data) -> Void) -> CheckResult
     public var exec: Exec
     
     private let lock = NSLock()
@@ -19,10 +19,11 @@ public final class Runner: @unchecked Sendable {
     public init(paths: HubPaths, config: AppConfig) {
         self.paths = paths
         self._config = config
-        self.exec = { Proc.run($0, cwd: $1, env: $2, stdin: $3, timeout: $4, onStart: $5) }
+        self.exec = { Proc.run($0, cwd: $1, env: $2, stdin: $3, timeout: $4, onStart: $5, onOutput: $6) }
     }
     
     public func start(_ job: Job, worker: ModelEntry, now: Date) -> Job {
+        JobLog.prune(paths)
         if let current = JobStore(paths: paths).get(job.id), current.state != .queued { return current }
         let began = Date()
         let result = execute(job, worker: worker, now: now)
@@ -74,6 +75,7 @@ public final class Runner: @unchecked Sendable {
                                 j.state = .failed
                                 j.note = "Worktree creation failed: \(res.output)"
                                 try? store.save(j)
+                                JobLog.mark(paths, j.id, "job failed")
                                 return j
                             }
                             j.worktree = runDir
@@ -91,12 +93,14 @@ public final class Runner: @unchecked Sendable {
                 j.state = .failed
                 j.note = "untrusted harness only runs generic jobs"
                 try? store.save(j)
+                JobLog.mark(paths, j.id, "job failed")
                 return j
             }
             if !Sandbox.available() {
                 j.state = .failed
                 j.note = "macOS sandbox unavailable for untrusted harness"
                 try? store.save(j)
+                JobLog.mark(paths, j.id, "job failed")
                 return j
             }
         }
@@ -111,6 +115,7 @@ public final class Runner: @unchecked Sendable {
                     j.state = .failed
                     j.note = "Worktree creation failed: \(res.output)"
                     try? store.save(j)
+                    JobLog.mark(paths, j.id, "job failed")
                     return j
                 }
                 j.worktree = runDir
@@ -137,6 +142,7 @@ public final class Runner: @unchecked Sendable {
                 j.state = .failed
                 j.note = "Sandbox prepare failed: \(error)"
                 try? store.save(j)
+                JobLog.mark(paths, j.id, "job failed")
                 return j
             }
         }
@@ -179,20 +185,25 @@ public final class Runner: @unchecked Sendable {
             if !harness.trusted { argv = Sandbox.wrap(argv) }
             
             if store.get(j.id)?.state == .cancelled {
+                JobLog.mark(paths, j.id, "job cancelled")
                 return store.get(j.id) ?? j
             }
             
-            let res = exec(argv, stage?.dir.path ?? runDir, env, stdin, config.limits.jobTimeoutSeconds) { pid in
+            JobLog.mark(paths, j.id, "worker \(worker.id) (\(worker.harness))")
+            let res = exec(argv, stage?.dir.path ?? runDir, env, stdin, config.limits.jobTimeoutSeconds, { pid in
                 self.lock.lock()
                 self.pids[j.id] = pid
                 self.lock.unlock()
-            }
+            }, { data in
+                JobLog.append(self.paths, j.id, data)
+            })
             
             self.lock.lock()
             self.pids.removeValue(forKey: j.id)
             self.lock.unlock()
             
             if store.get(j.id)?.state == .cancelled {
+                JobLog.mark(paths, j.id, "job cancelled")
                 return store.get(j.id) ?? j
             }
             
@@ -211,6 +222,7 @@ public final class Runner: @unchecked Sendable {
                     j.state = .failed
                     j.output = formatOutput(lastOutput, harness: harness)
                     try? store.save(j)
+                    JobLog.mark(paths, j.id, "job failed")
                     return j
                 }
                 continue // Try next candidate
@@ -232,6 +244,7 @@ public final class Runner: @unchecked Sendable {
             j.harness = nil
             j.model = nil
             try? store.save(j)
+            JobLog.mark(paths, j.id, "job queued")
             return j
         }
         
@@ -253,6 +266,7 @@ public final class Runner: @unchecked Sendable {
         
         j.finished = Date()
         try? store.save(j)
+        JobLog.mark(paths, j.id, "job \(j.state.rawValue)")
         return j
     }
     
@@ -279,6 +293,7 @@ public final class Runner: @unchecked Sendable {
         j.broker = nil
         j.note = "masked offload skipped: \(reason); requeued for a trusted worker"
         try? store.save(j)
+        JobLog.mark(paths, j.id, "job queued")
         return j
     }
 
@@ -307,6 +322,7 @@ public final class Runner: @unchecked Sendable {
         try? FileManager.default.createDirectory(atPath: filesDir, withIntermediateDirectories: true, attributes: nil)
         
         // MASK
+        JobLog.mark(paths, j.id, "MASK \(brokerHarness.id)")
         let maskPrompt = Masked.maskPrompt(job: j, runDir: runDir, maskDir: maskDir)
         let maskRes = runHelper(j: &j, harness: brokerHarness, worker: brokerModel, prompt: maskPrompt, cwd: maskDir, projectEnv: maskDir, useSandbox: false, now: now, store: store)
         
@@ -317,6 +333,7 @@ public final class Runner: @unchecked Sendable {
             j.harness = nil
             j.model = nil
             try? store.save(j)
+            JobLog.mark(paths, j.id, "job queued")
             return j
         }
         if !maskRes.passed {
@@ -390,6 +407,7 @@ public final class Runner: @unchecked Sendable {
         var lastFailure = ""
         var passed = false
         for attempt in 0..<max(1, config.limits.maskedHeavyAttempts) {
+            JobLog.mark(paths, j.id, "HEAVY \(worker.id) attempt \(attempt + 1)")
             let workerRes = runHelper(j: &j, harness: workerHarness, worker: worker, prompt: heavyPrompt, cwd: stage?.dir.path ?? filesDir, projectEnv: stage?.dir.path ?? filesDir, useSandbox: true, now: now, store: store, baseEnv: stage?.env)
             
             if !workerRes.workerExited {
@@ -398,6 +416,7 @@ public final class Runner: @unchecked Sendable {
                 j.harness = nil
                 j.model = nil
                 try? store.save(j)
+                JobLog.mark(paths, j.id, "job queued")
                 return j
             }
             
@@ -410,17 +429,21 @@ public final class Runner: @unchecked Sendable {
             // The check may run files the untrusted worker edited, so it runs in the same sandbox.
             var checkEnv = stage?.env ?? ProcessInfo.processInfo.environment
             checkEnv["PWD"] = filesDir
-            let checkRes = exec(Sandbox.wrap(checkArgv), filesDir, checkEnv, nil, 600) { pid in
+            let checkRes = exec(Sandbox.wrap(checkArgv), filesDir, checkEnv, nil, 600, { pid in
                 self.lock.lock()
                 self.pids[j.id] = pid
                 self.lock.unlock()
-            }
+            }, { data in
+                JobLog.append(self.paths, j.id, data)
+            })
             self.lock.lock()
             self.pids.removeValue(forKey: j.id)
             self.lock.unlock()
             
             Activity.log("masked.heavy", job: j.id, harness: worker.harness, model: worker.id, ["attempt": String(attempt + 1), "check": checkRes.passed ? "pass" : "fail"], paths: paths)
-            if checkRes.exitCode == 0 && !checkRes.timedOut { passed = true; break }
+            let checkPassed = checkRes.exitCode == 0 && !checkRes.timedOut
+            JobLog.mark(paths, j.id, "masked check \(checkPassed ? "pass" : "fail")")
+            if checkPassed { passed = true; break }
             lastFailure = "masked check failed: \(String(checkRes.output.suffix(800)))\nworker output: \(String(workerRes.output.suffix(1500)))"
             heavyPrompt = Masked.retryPrompt(basePrompt, feedback: Masked.feedback(checkRes.output, dirs: [filesDir, maskDir, stage?.dir.path ?? filesDir], tokens: tokens))
         }
@@ -432,6 +455,7 @@ public final class Runner: @unchecked Sendable {
         let before = snapshot(runDir)
         let baseHead = head(runDir)
         
+        JobLog.mark(paths, j.id, "DECODE \(brokerHarness.id)")
         let decodePrompt = Masked.decodePrompt(job: j, runDir: runDir, maskDir: maskDir)
         let decodeRes = runHelper(j: &j, harness: brokerHarness, worker: brokerModel, prompt: decodePrompt, cwd: runDir, projectEnv: runDir, useSandbox: false, now: now, store: store)
         
@@ -442,6 +466,7 @@ public final class Runner: @unchecked Sendable {
             j.harness = nil
             j.model = nil
             try? store.save(j)
+            JobLog.mark(paths, j.id, "job queued")
             return j
         }
         
@@ -458,6 +483,7 @@ public final class Runner: @unchecked Sendable {
         j.output = "MASK (\(brokerModel.id)): ok\nHEAVY (\(worker.id)): masked check passed\nDECODE (\(brokerModel.id)): \(decodeRes.passed ? "ok" : "exit nonzero")\n\n" + String(decodeRes.output.suffix(2000))
         j.note = "masked via \(brokerModel.id)"
         try? store.save(j)
+        JobLog.mark(paths, j.id, "job \(j.state.rawValue)")
         return j
     }
     
@@ -495,11 +521,13 @@ public final class Runner: @unchecked Sendable {
             }
             
             let jobId = j.id
-            let res = exec(argv, cwd, env, stdin, config.limits.jobTimeoutSeconds) { pid in
+            let res = exec(argv, cwd, env, stdin, config.limits.jobTimeoutSeconds, { pid in
                 self.lock.lock()
                 self.pids[jobId] = pid
                 self.lock.unlock()
-            }
+            }, { data in
+                JobLog.append(self.paths, jobId, data)
+            })
             
             self.lock.lock()
             self.pids.removeValue(forKey: jobId)
@@ -565,7 +593,10 @@ public final class Runner: @unchecked Sendable {
             let diff = Proc.run(["git", "diff", "--name-only", "-z", baseHead, postHead], cwd: runDir).output
             changed.formUnion(diff.split(separator: "\0").map(String.init).filter { !$0.isEmpty })
         }
-        let acceptance = Proc.run(job.checkArgv, cwd: runDir, timeout: 600)
+        JobLog.mark(paths, job.id, "check \(job.checkArgv.joined(separator: " "))")
+        let acceptance = Proc.run(job.checkArgv, cwd: runDir, timeout: 600, onOutput: { data in
+            JobLog.append(self.paths, job.id, data)
+        })
 
         for f in Set(preHashes.keys).union(postHashes.keys) where preHashes[f] != postHashes[f] {
             changed.insert(f)
@@ -584,6 +615,8 @@ public final class Runner: @unchecked Sendable {
             if !matched { outsideAllowed.append(f) }
         }
         
+        let gatePassed = acceptance.passed && outsideAllowed.isEmpty
+        JobLog.mark(paths, job.id, "gate \(gatePassed ? "passed" : "failed") · changed \(changedFiles.count) · outside \(outsideAllowed.count)")
         return GateResult(acceptance: acceptance, changedFiles: changedFiles, outsideAllowed: outsideAllowed)
     }
     

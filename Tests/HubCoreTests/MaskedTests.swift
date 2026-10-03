@@ -87,17 +87,20 @@ struct MaskedTests {
         try? FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
         
         let runner = Runner(paths: paths, config: s.config)
+        // The project sits beside the hub data so the live job log is not a project change.
+        let project = paths.root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         
-        var job = Job(project: paths.root.path, objective: "obj", allowedFiles: ["main.swift"], checkArgv: ["sh", "test.sh"], size: .hard, kind: .implement, privacy: .project, created: now)
+        var job = Job(project: project.path, objective: "obj", allowedFiles: ["main.swift"], checkArgv: ["sh", "test.sh"], size: .hard, kind: .implement, privacy: .project, created: now)
         job.broker = "m1"
-        try? "original code".write(to: paths.root.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
-        try "exit 0\n".write(to: paths.root.appendingPathComponent("test.sh"), atomically: true, encoding: .utf8)
+        try? "original code".write(to: project.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+        try "exit 0\n".write(to: project.appendingPathComponent("test.sh"), atomically: true, encoding: .utf8)
         for argv in [["git", "init", "-q"], ["git", "add", "-A"], ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]] {
-            _ = Proc.run(argv, cwd: paths.root.path)
+            _ = Proc.run(argv, cwd: project.path)
         }
         
         let workerPrompts = Box<[String]>([])
-        runner.exec = { argv, cwd, env, stdin, timeout, pidCallback in
+        runner.exec = { argv, cwd, env, stdin, timeout, pidCallback, onOutput in
             let dir = cwd ?? ""
             if argv.contains(where: { $0 == "m1" }) {
                 // broker
@@ -138,7 +141,7 @@ struct MaskedTests {
         #expect(workerPrompts.value.count == 2)
         #expect(workerPrompts.value.last?.contains("not edited: ./main.swift") == true)
         #expect(workerPrompts.value.last?.contains("agenthub-mask") == false)
-        #expect(try String(contentsOf: paths.root.appendingPathComponent("main.swift"), encoding: .utf8) == "decoded code")
+        #expect(try String(contentsOf: project.appendingPathComponent("main.swift"), encoding: .utf8) == "decoded code")
     }
 
     @Test func testRunnerFakeExecLeakedToken() throws {
@@ -156,7 +159,7 @@ struct MaskedTests {
             _ = Proc.run(argv, cwd: paths.root.path)
         }
         
-        runner.exec = { argv, cwd, env, stdin, timeout, pidCallback in
+        runner.exec = { argv, cwd, env, stdin, timeout, pidCallback, onOutput in
             let dir = cwd ?? ""
             if argv.contains(where: { $0 == "m1" }) {
                 let prompt = stdin ?? ""

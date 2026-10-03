@@ -65,7 +65,7 @@ struct JobsTests {
         
         let job = Job(project: project, objective: "test", allowedFiles: ["allowed.txt"], checkArgv: ["echo", "ok"], size: .tiny, kind: .implement, privacy: .project, created: Date())
         
-        runner.exec = { argv, cwd, env, stdin, timeout, onStart in
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
             // write allowed file
             let url = URL(fileURLWithPath: cwd!).appendingPathComponent("allowed.txt")
             try! "content".write(to: url, atomically: true, encoding: .utf8)
@@ -88,7 +88,7 @@ struct JobsTests {
         
         let job = Job(project: project, objective: "test", allowedFiles: ["allowed.txt"], checkArgv: ["echo", "ok"], size: .tiny, kind: .implement, privacy: .project, created: Date())
         
-        runner.exec = { argv, cwd, env, stdin, timeout, onStart in
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
             // write outside allowed
             let url = URL(fileURLWithPath: cwd!).appendingPathComponent("outside.txt")
             try! "content".write(to: url, atomically: true, encoding: .utf8)
@@ -132,7 +132,7 @@ struct JobsTests {
         let job2 = Job(project: project, objective: "t", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, isolation: .worktree, created: Date())
         try! store.enqueue(job2)
         
-        runner.exec = { argv, cwd, env, stdin, timeout, onStart in
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
             let url = URL(fileURLWithPath: cwd!).appendingPathComponent("a.txt")
             try! "content".write(to: url, atomically: true, encoding: .utf8)
             return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
@@ -156,7 +156,7 @@ struct JobsTests {
         let store = JobStore(paths: paths)
         try! store.enqueue(job)
         
-        runner.exec = { argv, cwd, env, stdin, timeout, onStart in
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
             let url = URL(fileURLWithPath: cwd!).appendingPathComponent("a.txt")
             try! "content".write(to: url, atomically: true, encoding: .utf8)
             _ = Proc.run(["git", "add", "a.txt"], cwd: cwd!)
@@ -197,7 +197,7 @@ struct JobsTests {
         let store = JobStore(paths: paths)
         try! store.enqueue(job)
         
-        runner.exec = { argv, cwd, env, stdin, timeout, onStart in
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
             return CheckResult(argv: argv, exitCode: 1, timedOut: false, output: "429 rate limit exceeded resets in 1h")
         }
         
@@ -229,7 +229,7 @@ struct JobsTests {
         // Codex jsonl
         let job1 = Job(project: project, objective: "t", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, created: Date())
         let worker1 = ModelEntry(id: "gpt-6.1-sol", harness: "codex", name: "GPT", intelligence: 97, isMain: true, isWorker: true)
-        runner.exec = { argv, cwd, env, stdin, timeout, onStart in
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
             let longText = String(repeating: "A", count: 5000)
             let out = """
             {"type": "item.completed", "item": {"type": "agent_message", "text": "foo"}}
@@ -244,7 +244,7 @@ struct JobsTests {
         // Claude json
         let job2 = Job(project: project, objective: "t", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, created: Date())
         let worker2 = ModelEntry(id: "claude-opus-5-5", harness: "claude", name: "Claude", intelligence: 97, isMain: true, isWorker: true)
-        runner.exec = { argv, cwd, env, stdin, timeout, onStart in
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
             let longText = String(repeating: "B", count: 5000)
             let out = "{\"result\": \"\(longText)\"}"
             return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: out)

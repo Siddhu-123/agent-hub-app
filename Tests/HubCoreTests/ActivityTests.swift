@@ -89,7 +89,7 @@ struct ActivityTests {
         var job = Job(project: project.path, objective: "PRIVATE_OBJECTIVE_SENTINEL", allowedFiles: ["main.swift"], checkArgv: ["sh", "test.sh"], size: .hard, kind: .implement, privacy: .project, created: now)
         job.broker = "m1"
         Activity.queued(job, paths: paths)
-        runner.exec = { argv, cwd, _, stdin, _, _ in
+        runner.exec = { argv, cwd, _, stdin, _, _, _ in
             let dir = URL(fileURLWithPath: cwd!)
             if argv.contains("m1") && (stdin ?? "").contains("MASK step") {
                 try? "generic brief".write(to: dir.appendingPathComponent("brief.md"), atomically: true, encoding: .utf8)
@@ -130,7 +130,7 @@ struct ActivityTests {
         let runner = Runner(paths: paths, config: config)
         var job = Job(project: project.path, objective: "objective", allowedFiles: ["main.swift"], checkArgv: ["sh", "test.sh"], size: .hard, kind: .implement, privacy: .project, created: now)
         job.broker = "m1"
-        runner.exec = { argv, cwd, _, stdin, _, _ in
+        runner.exec = { argv, cwd, _, stdin, _, _, _ in
             let dir = URL(fileURLWithPath: cwd!)
             if argv.contains("m1") && (stdin ?? "").contains("MASK step") {
                 try? "generic brief".write(to: dir.appendingPathComponent("brief.md"), atomically: true, encoding: .utf8)

@@ -32,7 +32,7 @@ struct EngineTests {
             return true
         }
         
-        let exec: Runner.Exec = { argv, cwd, env, stdin, timeout, onStart in
+        let exec: Runner.Exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
             let cwdStr = cwd ?? project
             let allowedFile = URL(fileURLWithPath: cwdStr).appendingPathComponent("file.txt")
             try? "dummy".write(to: allowedFile, atomically: true, encoding: .utf8)

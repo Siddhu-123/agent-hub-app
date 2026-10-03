@@ -6,7 +6,8 @@ public enum Proc {
     /// Output is truncated to the last `keep` characters. Never throws: launch failures return exit code 127.
     /// `onStart` receives the child PID right after launch (used for cancellation).
     public static func run(_ argv: [String], cwd: String? = nil, env: [String: String]? = nil, stdin: String? = nil,
-                           timeout: TimeInterval = 120, keep: Int = 200_000, onStart: ((Int32) -> Void)? = nil) -> CheckResult {
+                           timeout: TimeInterval = 120, keep: Int = 200_000, onStart: ((Int32) -> Void)? = nil,
+                           onOutput: ((Data) -> Void)? = nil) -> CheckResult {
         guard let first = argv.first, let exe = resolve(first) else {
             return CheckResult(argv: argv, exitCode: 127, timedOut: false, output: "executable not found: \(argv.first ?? "")")
         }
@@ -25,7 +26,12 @@ public enum Proc {
         let input = Pipe()
         p.standardInput = stdin == nil ? FileHandle.nullDevice : input
         let buffer = OutputBuffer(keep: keep)
-        out.fileHandleForReading.readabilityHandler = { h in buffer.append(h.availableData) }
+        out.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            guard !d.isEmpty else { return }
+            buffer.append(d)
+            onOutput?(d)
+        }
         do { try p.run() } catch {
             out.fileHandleForReading.readabilityHandler = nil
             return CheckResult(argv: argv, exitCode: 127, timedOut: false, output: "launch failed: \(error.localizedDescription)")
@@ -51,7 +57,11 @@ public enum Proc {
         }
         p.waitUntilExit()
         out.fileHandleForReading.readabilityHandler = nil
-        buffer.append(out.fileHandleForReading.readDataToEndOfFile())
+        let drain = out.fileHandleForReading.readDataToEndOfFile()
+        if !drain.isEmpty {
+            buffer.append(drain)
+            onOutput?(drain)
+        }
         return CheckResult(argv: argv, exitCode: timedOut ? -1 : p.terminationStatus, timedOut: timedOut, output: buffer.text)
     }
 

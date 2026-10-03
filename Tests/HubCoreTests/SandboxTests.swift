@@ -107,7 +107,7 @@ struct SandboxTests {
         var calledArgv: [String] = []
         var calledCwd: String? = nil
 
-        runner.exec = { (argv: [String], cwd: String?, env: [String: String]?, stdin: String?, timeout: TimeInterval, cb: @escaping (Int32) -> Void) -> CheckResult in
+        runner.exec = { (argv: [String], cwd: String?, env: [String: String]?, stdin: String?, timeout: TimeInterval, cb: @escaping (Int32) -> Void, _: @escaping (Data) -> Void) -> CheckResult in
             calledArgv = argv
             calledCwd = cwd
             
