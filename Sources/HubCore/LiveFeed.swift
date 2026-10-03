@@ -24,17 +24,18 @@ public struct LiveSession: Codable, Sendable {
     public var steps: Int
     public var startedAt, updatedAt: Double
     public var turnStartedAt, finishedAt: Double?
-    public var cwd, project, model, lastPrompt: String?
+    public var cwd, project, model, lastPrompt, transcript: String?
     public var recent: [LiveLine]?
     public var agents: [LiveAgent]?
     public init(platform: String, platformName: String, sessionId: String, title: String, status: String, activity: String, app: String,
                 pid: Int? = nil, steps: Int = 0, startedAt: Double, updatedAt: Double, turnStartedAt: Double? = nil,
                 finishedAt: Double? = nil, cwd: String? = nil, project: String? = nil, model: String? = nil,
-                lastPrompt: String? = nil, recent: [LiveLine]? = nil, agents: [LiveAgent]? = nil) {
+                lastPrompt: String? = nil, recent: [LiveLine]? = nil, agents: [LiveAgent]? = nil, transcript: String? = nil) {
         self.platform = platform; self.platformName = platformName; self.sessionId = sessionId; self.title = title
         self.status = status; self.activity = activity; self.app = app; self.pid = pid; self.steps = steps
         self.startedAt = startedAt; self.updatedAt = updatedAt; self.turnStartedAt = turnStartedAt; self.finishedAt = finishedAt
         self.cwd = cwd; self.project = project; self.model = model; self.lastPrompt = lastPrompt; self.recent = recent; self.agents = agents
+        self.transcript = transcript
     }
 }
 
@@ -234,7 +235,7 @@ public struct LiveFeed: Sendable {
             try update(["status": "waiting", "activity": "Waiting for your answer"])
         }
         func permissionLog(_ tool: String, _ outcome: String) { Activity.log("live.permission", harness: p, ["tool": tool, "outcome": outcome], paths: paths, now: now) }
-        let context: [String: Any] = ["cwd": cwd, "project": project, "model": d["model"] ?? ""]
+        let context: [String: Any] = ["cwd": cwd, "project": project, "model": d["model"] ?? "", "transcript": d["transcript_path"] ?? ""]
         if p == "claude" || p == "codex" {
             let tool = Self.text(d["tool_name"]), args = d["tool_input"] as? [String: Any] ?? [:]
             func saveAgents(_ agents: [LiveAgent]) throws {
