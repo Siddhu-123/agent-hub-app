@@ -40,6 +40,53 @@ struct LiveFeedTests {
         #expect((try FileManager.default.attributesOfItem(atPath: f.deletingLastPathComponent().path)[.posixPermissions] as? NSNumber)?.intValue == 0o700)
         #expect((try FileManager.default.attributesOfItem(atPath: paths.live.appendingPathComponent("platforms/claude.json").path)[.posixPermissions] as? NSNumber)?.intValue == 0o600)
     }
+    @Test func recentRingIsCappedAndSkipsDuplicateActivity() throws {
+        let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let feed = LiveFeed(paths: HubPaths(root: root)), start = Date()
+        for i in 0..<15 {
+            _ = feed.handle(platform: "claude", event: "PreToolUse", payload: ["session_id": "s", "tool_name": "Bash", "tool_input": ["command": "cmd\(i)"]], env: [:], pid: nil, now: start.addingTimeInterval(Double(i)))
+        }
+        _ = feed.handle(platform: "claude", event: "PreToolUse", payload: ["session_id": "s", "tool_name": "Bash", "tool_input": ["command": "cmd14"]], env: [:], pid: nil, now: start.addingTimeInterval(20))
+        let recent = try #require(feed.sessions().first?.recent)
+        #expect(recent.count == 12)
+        #expect(recent.first?.text == "Running cmd3")
+        #expect(recent.last?.text == "Running cmd14")
+    }
+
+    @Test func tracksTaskAgentsAndRoutesSubagentActivity() throws {
+        let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let feed = LiveFeed(paths: HubPaths(root: root)), now = Date()
+        let start: [String: Any] = ["session_id": "s", "tool_name": "Agent", "tool_use_id": "tool-1", "tool_input": ["subagent_type": "researcher", "description": "Find the relevant sources"]]
+        _ = feed.handle(platform: "claude", event: "PreToolUse", payload: start, env: [:], pid: nil, now: now)
+        var session = try #require(feed.sessions().first)
+        var agent = try #require(session.agents?.first)
+        #expect(agent.id == "tool-1")
+        #expect(agent.type == "researcher")
+        #expect(agent.description == "Find the relevant sources")
+        #expect(agent.status == "running")
+        #expect(agent.activity == "Starting")
+        let parentActivity = session.activity, parentRecent = session.recent
+        _ = feed.handle(platform: "claude", event: "PreToolUse", payload: ["session_id": "s", "agent_id": "sub-1", "agent_type": "researcher", "tool_name": "Read", "tool_input": ["file_path": "/work/a.swift"]], env: [:], pid: nil, now: now.addingTimeInterval(1))
+        session = try #require(feed.sessions().first); agent = try #require(session.agents?.first)
+        #expect(agent.activity == "Reading a.swift")
+        #expect(agent.recent?.last?.text == "Reading a.swift")
+        #expect(session.activity == parentActivity)
+        #expect(session.recent == parentRecent)
+        #expect(session.steps == 2)
+        _ = feed.handle(platform: "claude", event: "PostToolUse", payload: ["session_id": "s", "tool_name": "Agent", "tool_use_id": "tool-1"], env: [:], pid: nil, now: now.addingTimeInterval(2))
+        agent = try #require(feed.sessions().first?.agents?.first)
+        #expect(agent.status == "done")
+        #expect(agent.finishedAt == now.addingTimeInterval(2).timeIntervalSince1970)
+    }
+
+    @Test func prunesOldDoneAgents() throws {
+        let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let feed = LiveFeed(paths: HubPaths(root: root)), now = Date()
+        _ = feed.handle(platform: "codex", event: "PreToolUse", payload: ["thread_id": "s", "tool_name": "Task", "tool_use_id": "old", "tool_input": ["prompt": "old task"]], env: [:], pid: nil, now: now)
+        _ = feed.handle(platform: "codex", event: "PostToolUse", payload: ["thread_id": "s", "tool_name": "Task", "tool_use_id": "old"], env: [:], pid: nil, now: now)
+        _ = feed.handle(platform: "codex", event: "PreToolUse", payload: ["thread_id": "s", "tool_name": "Bash", "tool_input": ["command": "next"]], env: [:], pid: nil, now: now.addingTimeInterval(601))
+        #expect(feed.sessions().first?.agents?.isEmpty == true)
+    }
     @Test func notificationsAndQuestion() throws {
         let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
         let feed = LiveFeed(paths: HubPaths(root: root))

@@ -54,6 +54,15 @@ struct CLITests {
         #expect(job.state == .queued)
     }
 
+    @Test func parentSessionComesFromEnvironment() throws {
+        let claude = try CLIArgs.jobFromDelegateArgs(args(), now: now, env: ["CLAUDE_CODE_SESSION_ID": "c-123", "CODEX_THREAD_ID": "x-9"])
+        #expect(claude.parentSession == "claude:c-123")
+        let codex = try CLIArgs.jobFromDelegateArgs(args(), now: now, env: ["CLAUDE_CODE_SESSION_ID": "", "CODEX_THREAD_ID": "x-9"])
+        #expect(codex.parentSession == "codex:x-9")
+        let none = try CLIArgs.jobFromDelegateArgs(args(), now: now, env: [:])
+        #expect(none.parentSession == nil)
+    }
+
     @Test func delegateOverrides() throws {
         let job = try CLIArgs.jobFromDelegateArgs(args(["--size", "hard", "--kind", "review", "--privacy", "generic", "--worktree", "--allowed-file", "other.swift"]), now: now)
         #expect(job.size == .hard)

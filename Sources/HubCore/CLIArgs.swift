@@ -66,7 +66,7 @@ public struct CLIArgs {
     }
     public static func invalid(_ message: String) -> HubError { .invalid(message + "\n" + usage) }
 
-    public static func jobFromDelegateArgs(_ a: CLIArgs, now: Date) throws -> Job {
+    public static func jobFromDelegateArgs(_ a: CLIArgs, now: Date, env: [String: String] = ProcessInfo.processInfo.environment) throws -> Job {
         guard let size = JobSize(rawValue: a.value("size") ?? "routine") else { throw invalid("Invalid --size") }
         guard let kind = JobKind(rawValue: a.value("kind") ?? "implement") else { throw invalid("Invalid --kind") }
         guard let privacy = Privacy(rawValue: a.value("privacy") ?? "project") else { throw invalid("Invalid --privacy") }
@@ -80,6 +80,11 @@ public struct CLIArgs {
                    allowedFiles: files, checkArgv: check, size: size, kind: kind, privacy: privacy,
                    isolation: a.has("worktree") ? .worktree : .checkout,
                    mainModel: try a.required("main"), created: now)
+        if let session = env["CLAUDE_CODE_SESSION_ID"], !session.isEmpty {
+            job.parentSession = "claude:\(session)"
+        } else if let thread = env["CODEX_THREAD_ID"], !thread.isEmpty {
+            job.parentSession = "codex:\(thread)"
+        }
         if let offload = a.value("offload") {
             switch offload {
             case "auto": job.offload = nil

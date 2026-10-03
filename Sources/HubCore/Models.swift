@@ -266,6 +266,8 @@ public struct Job: Codable, Equatable, Identifiable, Sendable {
     public var isolation: Isolation
     /// The main model that delegated this job (model id), used for the same-harness rule.
     public var mainModel: String?
+    /// Harness-qualified session id of the main session that delegated this job.
+    public var parentSession: String?
     public var harness: String?
     public var model: String?
     public var state: JobState
