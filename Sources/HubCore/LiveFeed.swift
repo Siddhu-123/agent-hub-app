@@ -1,6 +1,23 @@
 import Foundation
 import Darwin
 
+public struct LiveLine: Codable, Equatable, Sendable {
+    public var t: Double
+    public var text: String
+    public init(t: Double, text: String) { self.t = t; self.text = text }
+}
+
+public struct LiveAgent: Codable, Equatable, Sendable {
+    public var id, type, description, status, activity: String
+    public var startedAt: Double
+    public var finishedAt: Double?
+    public var recent: [LiveLine]?
+    public init(id: String, type: String, description: String, status: String, activity: String, startedAt: Double, finishedAt: Double? = nil, recent: [LiveLine]? = nil) {
+        self.id = id; self.type = type; self.description = description; self.status = status; self.activity = activity
+        self.startedAt = startedAt; self.finishedAt = finishedAt; self.recent = recent
+    }
+}
+
 public struct LiveSession: Codable, Sendable {
     public var platform, platformName, sessionId, title, status, activity, app: String
     public var pid: Int?
@@ -8,6 +25,17 @@ public struct LiveSession: Codable, Sendable {
     public var startedAt, updatedAt: Double
     public var turnStartedAt, finishedAt: Double?
     public var cwd, project, model, lastPrompt: String?
+    public var recent: [LiveLine]?
+    public var agents: [LiveAgent]?
+    public init(platform: String, platformName: String, sessionId: String, title: String, status: String, activity: String, app: String,
+                pid: Int? = nil, steps: Int = 0, startedAt: Double, updatedAt: Double, turnStartedAt: Double? = nil,
+                finishedAt: Double? = nil, cwd: String? = nil, project: String? = nil, model: String? = nil,
+                lastPrompt: String? = nil, recent: [LiveLine]? = nil, agents: [LiveAgent]? = nil) {
+        self.platform = platform; self.platformName = platformName; self.sessionId = sessionId; self.title = title
+        self.status = status; self.activity = activity; self.app = app; self.pid = pid; self.steps = steps
+        self.startedAt = startedAt; self.updatedAt = updatedAt; self.turnStartedAt = turnStartedAt; self.finishedAt = finishedAt
+        self.cwd = cwd; self.project = project; self.model = model; self.lastPrompt = lastPrompt; self.recent = recent; self.agents = agents
+    }
 }
 
 public struct LiveRequest: Codable, Sendable {
@@ -181,6 +209,14 @@ public struct LiveFeed: Sendable {
                 Activity.log("live.session", harness: p, ["event": "start", "project": project], paths: paths, now: now)
             }
             for (k, v) in fields where !(v is NSNull) && (v as? String != "") { s[k] = v }
+            if p == "claude" || p == "codex", let activity = fields["activity"] as? String {
+                var recent = (s["recent"] as? [[String: Any]] ?? []).compactMap { line -> LiveLine? in
+                    guard let t = line["t"] as? Double, let text = line["text"] as? String else { return nil }
+                    return LiveLine(t: t, text: text)
+                }
+                if recent.last?.text != activity { recent.append(LiveLine(t: time, text: activity)) }
+                s["recent"] = Array(recent.suffix(12)).map { ["t": $0.t, "text": $0.text] }
+            }
             if fields["status"] as? String == "working", s["turnStartedAt"] == nil || s["turnStartedAt"] is NSNull { s["turnStartedAt"] = time }
             if ["idle", "done", "error"].contains(fields["status"] as? String ?? "") { s["turnStartedAt"] = NSNull() }
             s["updatedAt"] = time; try write(s, file)
@@ -201,6 +237,35 @@ public struct LiveFeed: Sendable {
         let context: [String: Any] = ["cwd": cwd, "project": project, "model": d["model"] ?? ""]
         if p == "claude" || p == "codex" {
             let tool = Self.text(d["tool_name"]), args = d["tool_input"] as? [String: Any] ?? [:]
+            func saveAgents(_ agents: [LiveAgent]) throws {
+                let encoded = try JSONEncoder().encode(agents)
+                let value = try JSONSerialization.jsonObject(with: encoded) as? [[String: Any]] ?? []
+                try update(["agents": value])
+            }
+            func prunedAgents(_ raw: Any?) -> [LiveAgent] {
+                let encoded = (try? JSONSerialization.data(withJSONObject: raw ?? [])) ?? Data("[]".utf8)
+                let agents = (try? JSONDecoder().decode([LiveAgent].self, from: encoded)) ?? []
+                return Array(agents.filter { $0.status != "done" || time - ($0.finishedAt ?? time) <= 600 }.suffix(12))
+            }
+            if let existingAgents = read(file)["agents"] { try saveAgents(prunedAgents(existingAgents)) }
+            let agentPayload = e == "PreToolUse" && !Self.text(d["agent_id"]).isEmpty
+            if agentPayload {
+                let agents = prunedAgents(read(file)["agents"])
+                let agentType = Self.text(d["agent_type"])
+                let index = agents.indices.reversed().first { agents[$0].status == "running" && (agentType.isEmpty || agents[$0].type == agentType) }
+                    ?? agents.indices.reversed().first { agents[$0].status == "running" }
+                if let index {
+                    var updated = agents
+                    let activity = Self.describeTool(tool, args)
+                    updated[index].activity = activity
+                    var recent = updated[index].recent ?? []
+                    if recent.last?.text != activity { recent.append(LiveLine(t: time, text: activity)) }
+                    updated[index].recent = Array(recent.suffix(12))
+                    try saveAgents(updated)
+                }
+                try update(["steps": (read(file)["steps"] as? Int ?? 0) + 1])
+                return nil
+            }
             switch e {
             case "SessionStart": try update(context.merging(["status": "idle", "activity": "Session started"]) { _, n in n })
             case "UserPromptSubmit":
@@ -208,9 +273,23 @@ public struct LiveFeed: Sendable {
                 let title = Self.text(read(file)["title"])
                 try update(context.merging(["status": "working", "activity": "Thinking…", "title": title.isEmpty ? Self.clip(Self.text(d["prompt"]).components(separatedBy: .newlines).first, 80) : title, "lastPrompt": Self.clip(d["prompt"], 200)]) { _, n in n })
             case "PreToolUse":
-                try update(context.merging(["status": "working", "activity": Self.describeTool(tool, args), "steps": (read(file)["steps"] as? Int ?? 0) + 1]) { _, n in n })
+                if ["Task", "Agent"].contains(tool) {
+                    let description = Self.clip(args["description"] ?? args["prompt"], 80)
+                    let agent = LiveAgent(id: Self.text(d["tool_use_id"]), type: Self.text(args["subagent_type"]).isEmpty ? "general-purpose" : Self.text(args["subagent_type"]), description: description, status: "running", activity: "Starting", startedAt: time)
+                    var agents = prunedAgents(read(file)["agents"]); agents.append(agent)
+                    try saveAgents(Array(agents.suffix(12)))
+                    try update(context.merging(["status": "working", "activity": Self.describeTool(tool, args), "steps": (read(file)["steps"] as? Int ?? 0) + 1]) { _, n in n })
+                } else {
+                    try update(context.merging(["status": "working", "activity": Self.describeTool(tool, args), "steps": (read(file)["steps"] as? Int ?? 0) + 1]) { _, n in n })
+                }
                 if tool == "AskUserQuestion" { try question(args) }
-            case "PostToolUse": clear(p, sid); try update(["status": "working", "cwd": cwd, "project": project])
+            case "PostToolUse":
+                if ["Task", "Agent"].contains(tool) {
+                    var agents = prunedAgents(read(file)["agents"])
+                    if let index = agents.indices.last(where: { agents[$0].id == Self.text(d["tool_use_id"]) }) { agents[index].status = "done"; agents[index].finishedAt = time }
+                    try saveAgents(agents)
+                }
+                clear(p, sid); try update(["status": "working", "cwd": cwd, "project": project])
             case "Notification":
                 let kind = Self.text(d["notification_type"]), msg = Self.clip(d["message"], 300)
                 if has("question") { break }
