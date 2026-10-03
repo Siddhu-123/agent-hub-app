@@ -78,7 +78,7 @@ public enum Sandbox {
         try FileManager.default.createDirectory(at: cacheDir, withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: stateDir, withIntermediateDirectories: true)
         
-        var env = baseEnv
+        var env = scrubbed(baseEnv)
         env["XDG_CONFIG_HOME"] = configDir.path
         env["XDG_DATA_HOME"] = dataDir.path
         env["XDG_CACHE_HOME"] = cacheDir.path
@@ -150,8 +150,34 @@ public enum Sandbox {
         return [exe, "-p", profile, Proc.resolve(first) ?? first] + argv.dropFirst()
     }
     
+    static func scrubbed(_ env: [String: String]) -> [String: String] {
+        let blockedSubstrings = [
+            "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL",
+            "API_KEY", "APIKEY", "PRIVATE_KEY", "ACCESS_KEY", "SESSION_KEY"
+        ]
+        let blockedPrefixes = [
+            "AWS_", "GH_", "GITHUB_", "ANTHROPIC_", "OPENAI_", "GEMINI_", "GOOGLE_API"
+        ]
+        
+        return env.filter { key, _ in
+            let upper = key.uppercased()
+            if blockedSubstrings.contains(where: { upper.contains($0) }) {
+                return false
+            }
+            if upper.hasSuffix("_KEY") {
+                return false
+            }
+            if blockedPrefixes.contains(where: { upper.hasPrefix($0) }) {
+                return false
+            }
+            return true
+        }
+    }
+    
     public static func collect(_ stage: Stage, into runDir: String) throws -> [String] {
         var copiedPaths: [String] = []
+        let resolvedRunDir = URL(fileURLWithPath: runDir).resolvingSymlinksInPath().standardized.path
+        
         for (basename, file) in stage.names {
             let stagedFile = stage.dir.appendingPathComponent(basename).path
             var isDir: ObjCBool = false
@@ -161,13 +187,31 @@ public enum Sandbox {
                     continue
                 }
                 
-                let targetFile = URL(fileURLWithPath: runDir).appendingPathComponent(file).path
+                let targetURL = URL(fileURLWithPath: runDir).appendingPathComponent(file)
+                let targetFile = targetURL.path
+                
+                let targetParentURL = targetURL.deletingLastPathComponent()
+                guard FileManager.default.fileExists(atPath: targetParentURL.path) else {
+                    continue
+                }
+                let resolvedParent = targetParentURL.resolvingSymlinksInPath().standardized.path
+                let parentPrefix = resolvedRunDir.hasSuffix("/") ? resolvedRunDir : resolvedRunDir + "/"
+                guard resolvedParent == resolvedRunDir || resolvedParent.hasPrefix(parentPrefix) else {
+                    continue
+                }
+                
+                // Skip if the target itself is a symlink
+                if let targetAttrs = try? FileManager.default.attributesOfItem(atPath: targetFile),
+                   let targetType = targetAttrs[.type] as? FileAttributeType,
+                   targetType == .typeSymbolicLink {
+                    continue
+                }
+                
                 let stagedData = try? Data(contentsOf: URL(fileURLWithPath: stagedFile))
                 let targetData = try? Data(contentsOf: URL(fileURLWithPath: targetFile))
                 
                 if stagedData != targetData {
-                    let targetURL = URL(fileURLWithPath: targetFile)
-                    try? FileManager.default.createDirectory(at: targetURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try? FileManager.default.createDirectory(at: targetParentURL, withIntermediateDirectories: true)
                     try? FileManager.default.removeItem(atPath: targetFile)
                     try? FileManager.default.copyItem(atPath: stagedFile, toPath: targetFile)
                     copiedPaths.append(file)

@@ -73,6 +73,12 @@ struct MaskedTests {
         
         try? "has secrettoken here".write(to: file, atomically: true, encoding: .utf8)
         #expect(!Masked.scan(dir: maskDir, tokens: ["secrettoken"]).isEmpty)
+        
+        let binaryFile = maskDir.appendingPathComponent("binary.bin")
+        let invalidUtf8Bytes: [UInt8] = [0xFF, 0xFE, 0xFD, 0x80]
+        try? Data(invalidUtf8Bytes).write(to: binaryFile)
+        let problems = Masked.scan(dir: maskDir, tokens: ["secrettoken"])
+        #expect(problems.contains("binary.bin: unreadable or binary file"))
     }
     
     @Test func feedbackScrubsDirsAndWithholdsPrivateText() {

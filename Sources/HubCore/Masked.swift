@@ -59,7 +59,10 @@ public enum Masked {
             let name = fileURL.lastPathComponent
             if name == "map.json" || name == "check.json" { continue }
             guard let isRegular = try? fileURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile, isRegular else { continue }
-            guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else { continue }
+            guard let content = try? String(contentsOf: fileURL, encoding: .utf8) else {
+                problems.append("\(name): unreadable or binary file")
+                continue
+            }
             problems += scan(text: content, name: name, tokens: tokens)
         }
         return problems

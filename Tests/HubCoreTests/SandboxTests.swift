@@ -152,4 +152,92 @@ struct SandboxTests {
         let s = try store.enqueue(j3)
         #expect(s.state == JobState.queued)
     }
+    
+    @Test func testSandboxScrubbed() {
+        let inputEnv: [String: String] = [
+            "SAFE_VAR": "value1",
+            "PATH": "/usr/bin:/bin",
+            "USER_TOKEN": "secret1",
+            "my_token_var": "secret2",
+            "CLIENT_SECRET": "secret3",
+            "USER_PASSWORD": "secret4",
+            "DB_PASSWD": "secret5",
+            "APP_CREDENTIAL": "secret6",
+            "API_KEY": "secret7",
+            "SERVICE_APIKEY": "secret8",
+            "MY_PRIVATE_KEY": "secret9",
+            "USER_ACCESS_KEY": "secret10",
+            "CURRENT_SESSION_KEY": "secret11",
+            "SIGNING_KEY": "secret12",
+            "AWS_REGION": "us-east-1",
+            "GH_TOKEN": "ghp_123",
+            "GITHUB_ACTIONS": "true",
+            "ANTHROPIC_API_KEY": "sk-ant-123",
+            "OPENAI_BASE_URL": "https://api.openai.com",
+            "GEMINI_MODEL": "gemini-pro",
+            "GOOGLE_API_PROJECT": "project-123"
+        ]
+        
+        let scrubbed = Sandbox.scrubbed(inputEnv)
+        #expect(scrubbed["SAFE_VAR"] == "value1")
+        #expect(scrubbed["PATH"] == "/usr/bin:/bin")
+        #expect(scrubbed.count == 2)
+        #expect(scrubbed["USER_TOKEN"] == nil)
+        #expect(scrubbed["my_token_var"] == nil)
+        #expect(scrubbed["CLIENT_SECRET"] == nil)
+        #expect(scrubbed["USER_PASSWORD"] == nil)
+        #expect(scrubbed["DB_PASSWD"] == nil)
+        #expect(scrubbed["APP_CREDENTIAL"] == nil)
+        #expect(scrubbed["API_KEY"] == nil)
+        #expect(scrubbed["SERVICE_APIKEY"] == nil)
+        #expect(scrubbed["MY_PRIVATE_KEY"] == nil)
+        #expect(scrubbed["USER_ACCESS_KEY"] == nil)
+        #expect(scrubbed["CURRENT_SESSION_KEY"] == nil)
+        #expect(scrubbed["SIGNING_KEY"] == nil)
+        #expect(scrubbed["AWS_REGION"] == nil)
+        #expect(scrubbed["GH_TOKEN"] == nil)
+        #expect(scrubbed["GITHUB_ACTIONS"] == nil)
+        #expect(scrubbed["ANTHROPIC_API_KEY"] == nil)
+        #expect(scrubbed["OPENAI_BASE_URL"] == nil)
+        #expect(scrubbed["GEMINI_MODEL"] == nil)
+        #expect(scrubbed["GOOGLE_API_PROJECT"] == nil)
+    }
+    
+    @Test func testCollectSymlinkContainment() throws {
+        let runDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        let outsideDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: runDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: outsideDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: runDir)
+            try? FileManager.default.removeItem(at: outsideDir)
+        }
+        
+        let outsideFile = outsideDir.appendingPathComponent("config.txt")
+        try "original outside".write(to: outsideFile, atomically: true, encoding: .utf8)
+        
+        // Create symlink 'linked' -> outsideDir inside runDir
+        let symlinkPath = runDir.appendingPathComponent("linked").path
+        try FileManager.default.createSymbolicLink(atPath: symlinkPath, withDestinationPath: outsideDir.path)
+        
+        // Prepare stage with allowed file 'linked/config.txt'
+        let stageWork = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        let stageDir = stageWork.appendingPathComponent("stage")
+        try FileManager.default.createDirectory(at: stageDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: stageWork) }
+        
+        let stagedConfig = stageDir.appendingPathComponent("config.txt")
+        try "malicious overwrite".write(to: stagedConfig, atomically: true, encoding: .utf8)
+        
+        let stage = Sandbox.Stage(
+            work: stageWork,
+            dir: stageDir,
+            env: [:],
+            names: ["config.txt": "linked/config.txt"]
+        )
+        
+        let collected = try Sandbox.collect(stage, into: runDir.path)
+        #expect(collected.isEmpty)
+        #expect(try String(contentsOf: outsideFile) == "original outside")
+    }
 }
