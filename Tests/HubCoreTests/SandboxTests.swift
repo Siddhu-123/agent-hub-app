@@ -240,4 +240,56 @@ struct SandboxTests {
         #expect(collected.isEmpty)
         #expect(try String(contentsOf: outsideFile) == "original outside")
     }
+    
+    @Test func testMaskDirDenial() throws {
+        guard Sandbox.available() else { return }
+        
+        let maskDir = URL(fileURLWithPath: "/private/tmp/agenthub-mask-test-\(UUID().uuidString)")
+        let stageDir = URL(fileURLWithPath: "/private/tmp/agenthub-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: maskDir, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: stageDir, withIntermediateDirectories: true)
+        defer {
+            try? FileManager.default.removeItem(at: maskDir)
+            try? FileManager.default.removeItem(at: stageDir)
+        }
+        
+        let maskFile = maskDir.appendingPathComponent("map.json")
+        try "{\"secret\": \"val\"}".write(to: maskFile, atomically: true, encoding: .utf8)
+        
+        let stageFile = stageDir.appendingPathComponent("test.txt")
+        try "stage content".write(to: stageFile, atomically: true, encoding: .utf8)
+        
+        let maskReadRes = Proc.run(Sandbox.wrap(["/bin/cat", maskFile.path]))
+        #expect(!maskReadRes.passed)
+        
+        let stageReadRes = Proc.run(Sandbox.wrap(["/bin/cat", stageFile.path]))
+        #expect(stageReadRes.passed)
+    }
+    
+    @Test func testCollectAllowedFileInNewDirectory() throws {
+        let runDir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: runDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: runDir) }
+        
+        let stageWork = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent(UUID().uuidString)
+        let stageDir = stageWork.appendingPathComponent("stage")
+        try FileManager.default.createDirectory(at: stageDir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: stageWork) }
+        
+        let stagedA = stageDir.appendingPathComponent("a.txt")
+        try "new a content".write(to: stagedA, atomically: true, encoding: .utf8)
+        
+        let stage = Sandbox.Stage(
+            work: stageWork,
+            dir: stageDir,
+            env: [:],
+            names: ["a.txt": "newdir/sub/a.txt"]
+        )
+        
+        let collected = try Sandbox.collect(stage, into: runDir.path)
+        #expect(collected == ["newdir/sub/a.txt"])
+        let targetFile = runDir.appendingPathComponent("newdir/sub/a.txt")
+        #expect(try String(contentsOf: targetFile) == "new a content")
+    }
 }
+

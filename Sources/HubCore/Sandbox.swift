@@ -4,7 +4,7 @@ public enum Sandbox {
     static let exe = "/usr/bin/sandbox-exec"
     static let profile = """
         (version 1) (allow default)
-        (deny file-read* file-write* (subpath "/Users") (subpath "/Volumes") (subpath "/private/var/folders"))
+        (deny file-read* file-write* (subpath "/Users") (subpath "/Volumes") (subpath "/private/var/folders") (regex #"^/private/tmp/agenthub-mask-"))
         (deny network-outbound (remote ip "localhost:*"))
         
         """
@@ -44,10 +44,12 @@ public enum Sandbox {
         
         var template = Array("/private/tmp/agenthub-XXXXXX".utf8)
         template.append(0)
-        guard let ptr = template.withUnsafeMutableBufferPointer({ mkdtemp($0.baseAddress) }) else {
+        let workPath: String? = template.withUnsafeMutableBufferPointer { b in
+            mkdtemp(b.baseAddress).map { String(cString: $0) }
+        }
+        guard let workPath = workPath else {
             throw HubError.invalid("Failed to create temporary directory")
         }
-        let workPath = String(cString: ptr)
         let work = URL(fileURLWithPath: workPath)
         
         chmod(workPath, 0o700)
@@ -187,16 +189,20 @@ public enum Sandbox {
                     continue
                 }
                 
-                let targetURL = URL(fileURLWithPath: runDir).appendingPathComponent(file)
+                let targetURL = URL(fileURLWithPath: runDir).appendingPathComponent(file).standardized
                 let targetFile = targetURL.path
                 
                 let targetParentURL = targetURL.deletingLastPathComponent()
-                guard FileManager.default.fileExists(atPath: targetParentURL.path) else {
+                var ancestorURL = targetParentURL
+                while !FileManager.default.fileExists(atPath: ancestorURL.path) && ancestorURL.path != "/" {
+                    ancestorURL = ancestorURL.deletingLastPathComponent()
+                }
+                guard FileManager.default.fileExists(atPath: ancestorURL.path) else {
                     continue
                 }
-                let resolvedParent = targetParentURL.resolvingSymlinksInPath().standardized.path
+                let resolvedAncestor = ancestorURL.resolvingSymlinksInPath().standardized.path
                 let parentPrefix = resolvedRunDir.hasSuffix("/") ? resolvedRunDir : resolvedRunDir + "/"
-                guard resolvedParent == resolvedRunDir || resolvedParent.hasPrefix(parentPrefix) else {
+                guard resolvedAncestor == resolvedRunDir || resolvedAncestor.hasPrefix(parentPrefix) else {
                     continue
                 }
                 
