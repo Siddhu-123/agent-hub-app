@@ -162,6 +162,13 @@ import Testing
         #expect(throws: Never.self) { try ConfigStore.validate(c) }
     }
 
+    @Test(arguments: [0.0, -1.0, Double.infinity, Double.nan])
+    func rejectsInvalidTimeout(timeout: Double) {
+        var config = ConfigStore.defaults()
+        config.limits.jobTimeoutSeconds = timeout
+        #expect(throws: HubError.self) { try ConfigStore.validate(config) }
+    }
+
     @Test func removeModel() throws {
         var c = ConfigStore.defaults()
         #expect(c.model("claude-opus-5-5") != nil)

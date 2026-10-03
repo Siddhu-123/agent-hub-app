@@ -739,6 +739,125 @@ struct JobsTests {
         #expect(implementWithChanges.passed(for: .implement) == true)
     }
 
+    @Test
+    func testTimeoutArgumentPropagation() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+
+        var config = ConfigStore.defaults()
+        config.harnesses.append(Harness(id: "timeout-test", name: "T", executable: "echo", trusted: true, usageSource: .none, hookStyle: .none, mainArgs: [], workerArgs: ["{exe}", "{timeout}s"]))
+        let runner = Runner(paths: paths, config: config)
+        let worker = ModelEntry(id: "m", harness: "timeout-test", name: "m", intelligence: 50, isMain: false, isWorker: true)
+
+        let job = Job(project: project, objective: "obj", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let store = JobStore(paths: paths)
+        try! store.enqueue(job)
+
+        var executedArgv: [String] = []
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            executedArgv = argv
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+
+        _ = runner.start(store.active().first!, worker: worker, now: Date())
+        #expect(executedArgv == ["echo", "\(Int(config.limits.jobTimeoutSeconds))s"])
+    }
+
+    @Test
+    func testWorkerFailureVerdict() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+
+        let runner = Runner(paths: paths, config: ConfigStore.defaults())
+        let worker = ModelEntry(id: "gpt-6.1-sol", harness: "codex", name: "GPT", intelligence: 97, isMain: true, isWorker: true)
+        let job = Job(project: project, objective: "t", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let store = JobStore(paths: paths)
+        try! store.enqueue(job)
+
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            if argv == ["echo"] {
+                return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "ok")
+            }
+            // Worker exits 1 (failure)
+            return CheckResult(argv: argv, exitCode: 1, timedOut: false, output: "compile error")
+        }
+
+        let res = runner.start(store.active().first!, worker: worker, now: Date())
+        #expect(res.state == .needsReview)
+        #expect(res.note == "worker failed (nonzero exit)")
+    }
+
+    @Test
+    func testAntigravityTemplates() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        var config = ConfigStore.defaults()
+        config.limits.jobTimeoutSeconds = 42.5
+
+        let harnessIndex = config.harnesses.firstIndex { $0.id == "antigravity" }!
+        let timeoutIndex = config.harnesses[harnessIndex].workerArgs.firstIndex(of: "--print-timeout")! + 1
+        config.harnesses[harnessIndex].workerArgs[timeoutIndex] = "600s"
+        let legacyHarness = config.harness("antigravity")!
+        var customHarness = legacyHarness
+        customHarness.workerArgs = ["{exe}", "--model", "{model}", "--dangerously-skip-permissions", "--print-timeout", "300s", "-p", "{prompt}"] // Different from exact legacy match
+
+        let runner = Runner(paths: paths, config: config)
+        let workerLeg = ModelEntry(id: "leg", harness: "antigravity", name: "leg", intelligence: 50, isMain: false, isWorker: true)
+        let workerCus = ModelEntry(id: "cus", harness: "antigravity", name: "cus", intelligence: 50, isMain: false, isWorker: true)
+
+        let job1 = Job(project: project, objective: "t1", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let job2 = Job(project: project, objective: "t2", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let store = JobStore(paths: paths)
+        try! store.enqueue(job1)
+        try! store.enqueue(job2)
+
+        var executedArgv: [String] = []
+        runner.exec = { argv, _, _, _, _, _, _ in
+            executedArgv = argv
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+
+        _ = runner.start(job1, worker: workerLeg, now: Date())
+        #expect(executedArgv.contains("42.5s"))
+        #expect(!executedArgv.contains("600s"))
+
+        config.harnesses[harnessIndex] = customHarness
+        runner.config = config
+        _ = runner.start(job2, worker: workerCus, now: Date())
+        #expect(executedArgv.contains("300s"))
+        #expect(!executedArgv.contains("42.5s"))
+    }
+
+    @Test
+    func testAgyTimeoutVsNonzero() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        let config = ConfigStore.defaults()
+        let runner = Runner(paths: paths, config: config)
+        let worker = config.model("gemini-3.1-pro-high")!
+        let job1 = Job(project: project, objective: "t1", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let job2 = Job(project: project, objective: "t2", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let store = JobStore(paths: paths)
+        try! store.enqueue(job1)
+        try! store.enqueue(job2)
+
+        // Zero-exit agy print timeout
+        runner.exec = { _, _, _, _, _, _, _ in
+            return CheckResult(argv: [], exitCode: 0, timedOut: false, output: "[agy] print timeout reached")
+        }
+        let res1 = runner.start(job1, worker: worker, now: Date())
+        #expect(res1.state == .needsReview)
+        #expect(res1.note == "worker failed (timeout)")
+
+        // Real nonzero failure
+        runner.exec = { _, _, _, _, _, _, _ in
+            return CheckResult(argv: [], exitCode: 1, timedOut: false, output: "syntax error")
+        }
+        let res2 = runner.start(job2, worker: worker, now: Date())
+        #expect(res2.state == .needsReview)
+        #expect(res2.note == "worker failed (nonzero exit)")
+    }
+
     // Swift Testing doesn't have expectation. We can just wait for it.
     private func expectation(description: String) -> Expectation {
         return Expectation()

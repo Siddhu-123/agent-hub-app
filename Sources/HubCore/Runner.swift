@@ -169,6 +169,8 @@ public final class Runner: @unchecked Sendable {
             prompt = "Role: \(role)\nObjective: \(j.objective)\nAllowed files: \(j.allowedFiles.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", "))\nPrivacy class: \(j.privacy.rawValue)\nAcceptance argv (the hub runs it after you finish): \(j.checkArgv.joined(separator: " "))\nRules: only edit allowed files in the current directory; you cannot run shell commands."
         }
         
+        var workerPassed = false
+        var workerFailureReason: String? = nil
         for candidate in candidates {
             if !harness.accounts.isEmpty {
                 if let _ = Cooldowns.until(account: candidate, paths: paths, now: now) { continue }
@@ -179,17 +181,9 @@ public final class Runner: @unchecked Sendable {
             var env = stage?.env ?? ProcessInfo.processInfo.environment
             env[HubPaths.workerEnv] = "1"
             
-            let stdin = harness.promptViaStdin ? prompt : nil
-            let pStr = harness.promptViaStdin ? "-" : prompt
-            let values = [
-                "exe": candidate,
-                "model": worker.id,
-                "effort": worker.effort ?? "high",
-                "project": stage?.dir.path ?? runDir,
-                "prompt": pStr
-            ]
-            var argv = Proc.fill(harness.workerArgs, values)
-            if !harness.trusted { argv = Sandbox.wrap(argv) }
+            let argRes = buildWorkerArgv(harness: harness, worker: worker, config: config, candidate: candidate, projectPath: stage?.dir.path ?? runDir, prompt: prompt, useSandbox: !harness.trusted)
+            let argv = argRes.argv
+            let stdin = argRes.stdin
             
             if store.get(j.id)?.state == .cancelled {
                 JobLog.mark(paths, j.id, "job cancelled")
@@ -235,7 +229,14 @@ public final class Runner: @unchecked Sendable {
                 continue // Try next candidate
             } else {
                 workerExited = true
-                if res.exitCode != 0 || res.timedOut {
+                let isAgyTimeout = harness.id == "antigravity" && res.output.contains("[agy] print timeout")
+                workerPassed = res.exitCode == 0 && !res.timedOut && !isAgyTimeout
+                if !workerPassed {
+                    if res.timedOut || isAgyTimeout {
+                        workerFailureReason = "timeout"
+                    } else {
+                        workerFailureReason = "nonzero exit"
+                    }
                     j.output = formatOutput(lastOutput, harness: harness) + "\nExit code: \(res.exitCode)"
                 } else {
                     j.output = formatOutput(lastOutput, harness: harness)
@@ -274,7 +275,12 @@ public final class Runner: @unchecked Sendable {
         }
 
         if let g = j.gate {
-            j.state = g.passed(for: j.kind) ? .verified : .needsReview
+            if !workerPassed {
+                j.state = .needsReview
+                j.note = "worker failed (\(workerFailureReason ?? "unknown"))"
+            } else {
+                j.state = g.passed(for: j.kind) ? .verified : .needsReview
+            }
         }
         
         j.finished = Date()
@@ -314,6 +320,10 @@ public final class Runner: @unchecked Sendable {
     }
 
     private func fallbackMasked(job: Job, reason: String, store: JobStore) -> Job {
+        if store.get(job.id)?.state == .cancelled {
+            JobLog.mark(paths, job.id, "job cancelled")
+            return store.get(job.id) ?? job
+        }
         // Reasons may contain private scan tokens, paths or worker output. Emit only a fixed category.
         let category: String
         if reason.hasPrefix("scan detected") { category = "scan detected problems" }
@@ -364,61 +374,116 @@ public final class Runner: @unchecked Sendable {
         try? FileManager.default.createDirectory(atPath: filesDir, withIntermediateDirectories: true, attributes: nil)
         
         // MASK
-        JobLog.mark(paths, j.id, "MASK \(brokerHarness.id)")
-        let maskPrompt = Masked.maskPrompt(job: j, runDir: runDir, maskDir: maskDir)
-        let maskRes = runHelper(j: &j, harness: brokerHarness, worker: brokerModel, prompt: maskPrompt, cwd: maskDir, projectEnv: maskDir, useSandbox: false, now: now, store: store)
-        
-        Activity.log("masked.mask", job: j.id, harness: brokerHarness.id, model: brokerModel.id, ["result": maskRes.passed ? "ok" : "fail"], paths: paths)
-        if !maskRes.workerExited {
-            setCooldown("harness:\(brokerHarness.id)", until: maskRes.latestCooling, paths: paths)
-            j.state = .queued
-            j.harness = nil
-            j.model = nil
-            try? store.save(j)
-            JobLog.mark(paths, j.id, "job queued")
-            return j
-        }
-        if !maskRes.passed {
-            return fallbackMasked(job: j, reason: "MASK step failed or exhausted quota: \(maskRes.output)", store: store)
-        }
-        
-        // Validate
-        let briefPath = URL(fileURLWithPath: maskDir).appendingPathComponent("brief.md").path
-        let mapPath = URL(fileURLWithPath: maskDir).appendingPathComponent("map.json").path
-        let checkPath = URL(fileURLWithPath: maskDir).appendingPathComponent("check.json").path
-        
-        guard let briefText = try? String(contentsOfFile: briefPath, encoding: .utf8), !briefText.isEmpty else {
-            return fallbackMasked(job: j, reason: "brief.md missing or empty", store: store)
-        }
-        
-        guard let mapData = try? Data(contentsOf: URL(fileURLWithPath: mapPath)),
-              let mapDict = try? JSONSerialization.jsonObject(with: mapData) as? [String: Any],
-              let placeholders = mapDict["placeholders"] as? [String: String],
-              let _ = mapDict["files"] as? [String: String] else {
-            return fallbackMasked(job: j, reason: "map.json failed to decode", store: store)
-        }
-        
-        guard let checkData = try? Data(contentsOf: URL(fileURLWithPath: checkPath)),
-              let checkArgv = try? JSONSerialization.jsonObject(with: checkData) as? [String] else {
-            return fallbackMasked(job: j, reason: "check.json failed to decode", store: store)
-        }
-        
-        guard let files = try? FileManager.default.contentsOfDirectory(atPath: filesDir), !files.isEmpty else {
-            return fallbackMasked(job: j, reason: "files/ is empty", store: store)
-        }
-        
-        var flatFiles: [String] = []
-        for file in files {
-            flatFiles.append(file)
-            var isDir: ObjCBool = false
-            if FileManager.default.fileExists(atPath: URL(fileURLWithPath: filesDir).appendingPathComponent(file).path, isDirectory: &isDir), isDir.boolValue {
-                return fallbackMasked(job: j, reason: "files/ must only contain plain basenames", store: store)
+        var maskPrompt = Masked.maskPrompt(job: j, runDir: runDir, maskDir: maskDir)
+        var briefText = ""
+        var flatFiles = [String]()
+        var tokens = [String]()
+        var checkArgv = [String]()
+        var maskFailReason: String? = nil
+
+        for attempt in 0...1 {
+            JobLog.mark(paths, j.id, "MASK \(brokerHarness.id)" + (attempt > 0 ? " repair" : ""))
+            let maskRes = runHelper(j: &j, harness: brokerHarness, worker: brokerModel, prompt: maskPrompt, cwd: maskDir, projectEnv: maskDir, useSandbox: false, now: now, store: store)
+
+            if store.get(j.id)?.state == .cancelled {
+                JobLog.mark(paths, j.id, "job cancelled")
+                return store.get(j.id) ?? j
+            }
+
+            Activity.log("masked.mask", job: j.id, harness: brokerHarness.id, model: brokerModel.id, ["result": maskRes.passed ? "ok" : "fail"], paths: paths)
+            if !maskRes.workerExited {
+                setCooldown("harness:\(brokerHarness.id)", until: maskRes.latestCooling, paths: paths)
+                j.state = .queued
+                j.harness = nil
+                j.model = nil
+                try? store.save(j)
+                JobLog.mark(paths, j.id, "job queued")
+                return j
+            }
+            if !maskRes.passed {
+                maskFailReason = "MASK step failed or exhausted quota: \(maskRes.output)"
+                break
+            }
+
+            // Validate
+            let briefPath = URL(fileURLWithPath: maskDir).appendingPathComponent("brief.md").path
+            let mapPath = URL(fileURLWithPath: maskDir).appendingPathComponent("map.json").path
+            let checkPath = URL(fileURLWithPath: maskDir).appendingPathComponent("check.json").path
+
+            var missing = [String]()
+            if let text = try? String(contentsOfFile: briefPath, encoding: .utf8), !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                briefText = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            } else {
+                missing.append("brief.md missing or empty")
+            }
+
+            var mapDict: [String: Any]? = nil
+            var mapFiles = [String: String]()
+            if let mapData = try? Data(contentsOf: URL(fileURLWithPath: mapPath)),
+               let dict = try? JSONSerialization.jsonObject(with: mapData) as? [String: Any],
+               let _ = dict["placeholders"] as? [String: String],
+               let filesMap = dict["files"] as? [String: String], !filesMap.isEmpty,
+               filesMap.allSatisfy({ name, path in
+                   !name.isEmpty && URL(fileURLWithPath: name).lastPathComponent == name &&
+                   !path.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+                   !path.hasPrefix("/") && !path.components(separatedBy: "/").contains("..")
+               }) {
+                mapDict = dict
+                mapFiles = filesMap
+            } else {
+                missing.append("map.json missing, failed to decode, or empty files map")
+            }
+
+            if let checkData = try? Data(contentsOf: URL(fileURLWithPath: checkPath)),
+               let argv = try? JSONSerialization.jsonObject(with: checkData) as? [String], !argv.isEmpty, !argv.contains(where: { $0.isEmpty }) {
+                checkArgv = argv
+            } else {
+                missing.append("check.json missing, empty or contains empty strings")
+            }
+
+            if let files = try? FileManager.default.contentsOfDirectory(atPath: filesDir), !files.isEmpty {
+                var badFiles = false
+                var tmpFlat = [String]()
+                for file in files {
+                    tmpFlat.append(file)
+                    var isDir: ObjCBool = false
+                    if FileManager.default.fileExists(atPath: URL(fileURLWithPath: filesDir).appendingPathComponent(file).path, isDirectory: &isDir), isDir.boolValue {
+                        badFiles = true
+                        break
+                    }
+                }
+                if badFiles {
+                    missing.append("files/ must only contain plain basenames")
+                } else {
+                    flatFiles = tmpFlat
+                    let declaredFiles = Set(mapFiles.keys)
+                    let actualFiles = Set(flatFiles)
+                    if !declaredFiles.isSubset(of: actualFiles) {
+                        missing.append("files/ is missing some masked source files declared in map.json")
+                    }
+                }
+            } else {
+                missing.append("files/ is empty")
+            }
+
+            if missing.isEmpty {
+                maskFailReason = nil
+                let placeholders = mapDict!["placeholders"] as! [String: String]
+                var originalValues = Array(placeholders.values)
+                originalValues = originalValues.filter { $0.count >= 4 }
+                tokens = Masked.denyTokens(project: runDir) + originalValues
+                break
+            }
+
+            maskFailReason = missing.joined(separator: ", ")
+            if attempt == 0 {
+                maskPrompt = Masked.maskPrompt(job: j, runDir: runDir, maskDir: maskDir) + "\n\nCRITICAL: Previous attempt failed to produce valid artifacts: \(missing.joined(separator: ", ")). Please write the missing files correctly."
             }
         }
         
-        var originalValues = Array(placeholders.values)
-        originalValues = originalValues.filter { $0.count >= 4 }
-        let tokens = Masked.denyTokens(project: runDir) + originalValues
+        if let failReason = maskFailReason {
+            return fallbackMasked(job: j, reason: failReason, store: store)
+        }
         
         let problems = Masked.scan(dir: URL(fileURLWithPath: maskDir), tokens: tokens)
         Activity.log("masked.scan", job: j.id, [problems.isEmpty ? "result" : "problems": problems.isEmpty ? "ok" : String(problems.count)], paths: paths)
@@ -448,10 +513,19 @@ public final class Runner: @unchecked Sendable {
         var heavyPrompt = basePrompt
         var lastFailure = ""
         var passed = false
+        var heavyWorkerPassed = false
+        var heavyWorkerFailureReason: String? = nil
         for attempt in 0..<max(1, config.limits.maskedHeavyAttempts) {
             JobLog.mark(paths, j.id, "HEAVY \(worker.id) attempt \(attempt + 1)")
             let workerRes = runHelper(j: &j, harness: workerHarness, worker: worker, prompt: heavyPrompt, cwd: stage?.dir.path ?? filesDir, projectEnv: stage?.dir.path ?? filesDir, useSandbox: true, now: now, store: store, baseEnv: stage?.env)
             
+            heavyWorkerFailureReason = workerRes.failureReason
+
+            if store.get(j.id)?.state == .cancelled {
+                JobLog.mark(paths, j.id, "job cancelled")
+                return store.get(j.id) ?? j
+            }
+
             if !workerRes.workerExited {
                 setCooldown("harness:\(workerHarness.id)", until: workerRes.latestCooling, paths: paths)
                 j.state = .queued
@@ -483,10 +557,19 @@ public final class Runner: @unchecked Sendable {
             self.pids.removeValue(forKey: j.id)
             self.lock.unlock()
             
+            if store.get(j.id)?.state == .cancelled {
+                JobLog.mark(paths, j.id, "job cancelled")
+                return store.get(j.id) ?? j
+            }
+
             Activity.log("masked.heavy", job: j.id, harness: worker.harness, model: worker.id, ["attempt": String(attempt + 1), "check": checkRes.passed ? "pass" : "fail"], paths: paths)
             let checkPassed = checkRes.exitCode == 0 && !checkRes.timedOut
             JobLog.mark(paths, j.id, "masked check \(checkPassed ? "pass" : "fail")")
-            if checkPassed { passed = true; break }
+            if checkPassed {
+                passed = true
+                heavyWorkerPassed = workerRes.passed
+                break
+            }
             lastFailure = "masked check failed: \(String(checkRes.output.suffix(800)))\nworker output: \(String(workerRes.output.suffix(1500)))"
             heavyPrompt = Masked.retryPrompt(basePrompt, feedback: Masked.feedback(checkRes.output, dirs: [filesDir, maskDir, stage?.dir.path ?? filesDir], tokens: tokens))
         }
@@ -502,6 +585,11 @@ public final class Runner: @unchecked Sendable {
         let decodePrompt = Masked.decodePrompt(job: j, runDir: runDir, maskDir: maskDir)
         let decodeRes = runHelper(j: &j, harness: brokerHarness, worker: brokerModel, prompt: decodePrompt, cwd: runDir, projectEnv: runDir, useSandbox: false, now: now, store: store)
         
+        if store.get(j.id)?.state == .cancelled {
+            JobLog.mark(paths, j.id, "job cancelled")
+            return store.get(j.id) ?? j
+        }
+
         Activity.log("masked.decode", job: j.id, harness: brokerHarness.id, model: brokerModel.id, ["result": decodeRes.passed ? "ok" : "fail"], paths: paths)
         if !decodeRes.workerExited {
             setCooldown("harness:\(brokerHarness.id)", until: decodeRes.latestCooling, paths: paths)
@@ -523,7 +611,10 @@ public final class Runner: @unchecked Sendable {
             j.state = .needsReview
             j.note = "decode helper failed"
         } else if let g = j.gate {
-            if j.kind == .implement {
+            if !heavyWorkerPassed {
+                j.state = .needsReview
+                j.note = "worker failed (\(heavyWorkerFailureReason ?? "unknown"))"
+            } else if j.kind == .implement {
                 j.state = g.passed ? .verified : .needsReview
             } else {
                 j.state = (g.acceptance.passed && g.outsideAllowed.isEmpty) ? .verified : .needsReview
@@ -531,7 +622,7 @@ public final class Runner: @unchecked Sendable {
         }
         j.finished = Date()
         j.output = "MASK (\(brokerModel.id)): ok\nHEAVY (\(worker.id)): masked check passed\nDECODE (\(brokerModel.id)): \(decodeRes.passed ? "ok" : "exit nonzero")\n\n" + String(decodeRes.output.suffix(2000))
-        if decodeRes.passed {
+        if decodeRes.passed && heavyWorkerPassed {
             j.note = "masked via \(brokerModel.id)"
         }
         try? store.save(j)
@@ -539,12 +630,13 @@ public final class Runner: @unchecked Sendable {
         return j
     }
     
-    private func runHelper(j: inout Job, harness: Harness, worker: ModelEntry, prompt: String, cwd: String, projectEnv: String, useSandbox: Bool, now: Date, store: JobStore, baseEnv: [String: String]? = nil) -> (passed: Bool, workerExited: Bool, latestCooling: Date, output: String) {
+    private func runHelper(j: inout Job, harness: Harness, worker: ModelEntry, prompt: String, cwd: String, projectEnv: String, useSandbox: Bool, now: Date, store: JobStore, baseEnv: [String: String]? = nil) -> (passed: Bool, workerExited: Bool, latestCooling: Date, output: String, failureReason: String?) {
         let candidates = harness.accounts.isEmpty ? [harness.executable] : harness.accounts
         var lastOutput = ""
         var workerExited = false
         var latestCooling = now.addingTimeInterval(1800)
         var passed = false
+        var failureReason: String? = nil
         
         for candidate in candidates {
             if !harness.accounts.isEmpty {
@@ -556,20 +648,12 @@ public final class Runner: @unchecked Sendable {
             var env = baseEnv ?? ProcessInfo.processInfo.environment
             env[HubPaths.workerEnv] = "1"
             
-            let stdin = harness.promptViaStdin ? prompt : nil
-            let pStr = harness.promptViaStdin ? "-" : prompt
-            let values = [
-                "exe": candidate,
-                "model": worker.id,
-                "effort": worker.effort ?? "high",
-                "project": projectEnv,
-                "prompt": pStr
-            ]
-            var argv = Proc.fill(harness.workerArgs, values)
-            if useSandbox && !harness.trusted { argv = Sandbox.wrap(argv) }
+            let argRes = buildWorkerArgv(harness: harness, worker: worker, config: config, candidate: candidate, projectPath: projectEnv, prompt: prompt, useSandbox: useSandbox)
+            let argv = argRes.argv
+            let stdin = argRes.stdin
             
             if store.get(j.id)?.state == .cancelled {
-                return (false, true, latestCooling, "")
+                return (false, true, latestCooling, "", nil)
             }
             
             let jobId = j.id
@@ -586,7 +670,7 @@ public final class Runner: @unchecked Sendable {
             self.lock.unlock()
             
             if store.get(j.id)?.state == .cancelled {
-                return (false, true, latestCooling, "")
+                return (false, true, latestCooling, "", nil)
             }
             
             lastOutput = res.output
@@ -601,13 +685,19 @@ public final class Runner: @unchecked Sendable {
                 j.attempts.append(JobAttempt(harness: harness.id, model: worker.id, account: candidate, result: "quota", coolingUntil: coolingUntil))
                 
                 if j.attempts.count >= 3 {
-                    return (false, true, latestCooling, formatOutput(lastOutput, harness: harness))
+                    return (false, true, latestCooling, formatOutput(lastOutput, harness: harness), nil)
                 }
                 continue // Try next candidate
             } else {
                 workerExited = true
-                passed = res.exitCode == 0 && !res.timedOut
+                let isAgyTimeout = harness.id == "antigravity" && res.output.contains("[agy] print timeout")
+                passed = res.exitCode == 0 && !res.timedOut && !isAgyTimeout
                 if !passed {
+                    if res.timedOut || isAgyTimeout {
+                        failureReason = "timeout"
+                    } else {
+                        failureReason = "nonzero exit"
+                    }
                     lastOutput = formatOutput(lastOutput, harness: harness) + "\nExit code: \(res.exitCode)"
                 } else {
                     lastOutput = formatOutput(lastOutput, harness: harness)
@@ -615,7 +705,28 @@ public final class Runner: @unchecked Sendable {
                 break // No quota error, stop trying candidates
             }
         }
-        return (passed, workerExited, latestCooling, lastOutput)
+        return (passed, workerExited, latestCooling, lastOutput, failureReason)
+    }
+
+    private func buildWorkerArgv(harness: Harness, worker: ModelEntry, config: AppConfig, candidate: String, projectPath: String, prompt: String, useSandbox: Bool) -> (argv: [String], stdin: String?) {
+        let stdin = harness.promptViaStdin ? prompt : nil
+        let pStr = harness.promptViaStdin ? "-" : prompt
+        let timeoutStr = (config.limits.jobTimeoutSeconds.truncatingRemainder(dividingBy: 1) == 0) ? String(format: "%.0f", config.limits.jobTimeoutSeconds) : String(config.limits.jobTimeoutSeconds)
+        let values = [
+            "exe": candidate,
+            "model": worker.id,
+            "effort": worker.effort ?? "high",
+            "project": projectPath,
+            "prompt": pStr,
+            "timeout": timeoutStr
+        ]
+        var template = harness.workerArgs
+        if harness.id == "antigravity" && template == ["{exe}", "--model", "{model}", "--dangerously-skip-permissions", "--print-timeout", "600s", "-p", "{prompt}"] {
+            template = ["{exe}", "--model", "{model}", "--dangerously-skip-permissions", "--print-timeout", "{timeout}s", "-p", "{prompt}"]
+        }
+        var argv = Proc.fill(template, values)
+        if useSandbox && !harness.trusted { argv = Sandbox.wrap(argv) }
+        return (argv, stdin)
     }
     
     private func snapshot(_ runDir: String) -> [String: String] {

@@ -36,7 +36,7 @@ public enum ConfigStore {
                 usageSource: .manual,
                 hookStyle: .none,
                 mainArgs: ["{exe}", "--model", "{model}", "-i", "{prompt}"],
-                workerArgs: ["{exe}", "--model", "{model}", "--dangerously-skip-permissions", "--print-timeout", "600s", "-p", "{prompt}"]
+                workerArgs: ["{exe}", "--model", "{model}", "--dangerously-skip-permissions", "--print-timeout", "{timeout}s", "-p", "{prompt}"]
             ),
             Harness(
                 id: "opencode",
@@ -142,6 +142,10 @@ public enum ConfigStore {
 
         guard (1...12).contains(c.limits.maxMainSessions) else {
             throw HubError.invalid("maxMainSessions \(c.limits.maxMainSessions) outside 1...12")
+        }
+
+        guard c.limits.jobTimeoutSeconds > 0 && c.limits.jobTimeoutSeconds.isFinite else {
+            throw HubError.invalid("jobTimeoutSeconds must be finite and positive")
         }
 
         guard (0...16).contains(c.limits.maxJobs) else {

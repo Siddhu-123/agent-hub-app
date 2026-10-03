@@ -87,8 +87,11 @@ struct MaskedTests {
         #expect(Masked.feedback("see /Users/someone/x", dirs: [], tokens: []) == "(output withheld)")
     }
 
-    @Test func testRunnerFakeExec() throws {
-        let s = snapshot()
+    @Test(arguments: [Int32(0), Int32(1)])
+    func testRunnerFakeExec(heavyExit: Int32) throws {
+        var s = snapshot()
+        s.config.limits.jobTimeoutSeconds = 42.5
+        s.config.harnesses[0].workerArgs.append("{timeout}s")
         let paths = HubPaths(root: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hub-\(UUID().uuidString)"))
         try? FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
         
@@ -97,9 +100,10 @@ struct MaskedTests {
         let project = paths.root.appendingPathComponent("project")
         try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
         
-        var job = Job(project: project.path, objective: "obj", allowedFiles: ["main.swift"], checkArgv: ["sh", "test.sh"], size: .hard, kind: .implement, privacy: .project, created: now)
+        var job = Job(project: project.path, objective: "obj", allowedFiles: ["Sources/main.swift"], checkArgv: ["sh", "test.sh"], size: .hard, kind: .implement, privacy: .project, created: now)
         job.broker = "m1"
-        try? "original code".write(to: project.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+        try FileManager.default.createDirectory(at: project.appendingPathComponent("Sources"), withIntermediateDirectories: true)
+        try? "original code".write(to: project.appendingPathComponent("Sources/main.swift"), atomically: true, encoding: .utf8)
         try "exit 0\n".write(to: project.appendingPathComponent("test.sh"), atomically: true, encoding: .utf8)
         for argv in [["git", "init", "-q"], ["git", "add", "-A"], ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]] {
             _ = Proc.run(argv, cwd: project.path)
@@ -109,16 +113,17 @@ struct MaskedTests {
         runner.exec = { argv, cwd, env, stdin, timeout, pidCallback, onOutput in
             let dir = cwd ?? ""
             if argv.contains(where: { $0 == "m1" }) {
-                // broker
+                // Broker helper receives the configured fractional timeout.
+                #expect(argv.contains("42.5s"))
                 let prompt = stdin ?? ""
                 if prompt.contains("MASK step") {
                     let filesDir = URL(fileURLWithPath: dir).appendingPathComponent("files")
                     try? "generic brief".write(to: URL(fileURLWithPath: dir).appendingPathComponent("brief.md"), atomically: true, encoding: .utf8)
-                    try? "{\"placeholders\":{\"P1\":\"orig\"},\"files\":{\"main.swift\":\"main.swift\"}}".write(to: URL(fileURLWithPath: dir).appendingPathComponent("map.json"), atomically: true, encoding: .utf8)
+                    try? "{\"placeholders\":{\"P1\":\"orig\"},\"files\":{\"neutral.swift\":\"Sources/main.swift\"}}".write(to: URL(fileURLWithPath: dir).appendingPathComponent("map.json"), atomically: true, encoding: .utf8)
                     try? "[\"sh\",\"check.sh\"]".write(to: URL(fileURLWithPath: dir).appendingPathComponent("check.json"), atomically: true, encoding: .utf8)
-                    try? "masked code".write(to: filesDir.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+                    try? "masked code".write(to: filesDir.appendingPathComponent("neutral.swift"), atomically: true, encoding: .utf8)
                 } else if prompt.contains("DECODE step") {
-                    try? "decoded code".write(to: URL(fileURLWithPath: dir).appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+                    try? "decoded code".write(to: URL(fileURLWithPath: dir).appendingPathComponent("Sources/main.swift"), atomically: true, encoding: .utf8)
                 }
                 return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "broker ok")
             } else if argv.contains(where: { $0 == "m2" }) {
@@ -129,12 +134,12 @@ struct MaskedTests {
                 // The first attempt does nothing; the retry must carry the scrubbed check output.
                 workerPrompts.value.append(stdin ?? "")
                 if workerPrompts.value.count > 1 {
-                    try? "edited code".write(to: URL(fileURLWithPath: dir).appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+                    try? "edited code".write(to: URL(fileURLWithPath: dir).appendingPathComponent("neutral.swift"), atomically: true, encoding: .utf8)
                 }
-                return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "worker ok")
+                return CheckResult(argv: argv, exitCode: heavyExit, timedOut: false, output: "worker output")
             } else if argv.last == "check.sh" {
-                let edited = (try? String(contentsOfFile: dir + "/main.swift", encoding: .utf8)) == "edited code"
-                return CheckResult(argv: argv, exitCode: edited ? 0 : 1, timedOut: false, output: edited ? "check ok" : "not edited: \(dir)/main.swift")
+                let edited = (try? String(contentsOfFile: dir + "/neutral.swift", encoding: .utf8)) == "edited code"
+                return CheckResult(argv: argv, exitCode: edited ? 0 : 1, timedOut: false, output: edited ? "check ok" : "not edited: \(dir)/neutral.swift")
             } else if argv == ["sh", "test.sh"] {
                 return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "check ok")
             }
@@ -142,12 +147,12 @@ struct MaskedTests {
         }
         
         let finalJob = runner.start(job, worker: s.config.model("m2")!, now: now)
-        #expect(finalJob.state == .verified)
-        #expect(finalJob.note == "masked via m1")
+        #expect(finalJob.state == (heavyExit == 0 ? .verified : .needsReview))
+        #expect(finalJob.note == (heavyExit == 0 ? "masked via m1" : "worker failed (nonzero exit)"))
         #expect(workerPrompts.value.count == 2)
-        #expect(workerPrompts.value.last?.contains("not edited: ./main.swift") == true)
+        #expect(workerPrompts.value.last?.contains("not edited: ./neutral.swift") == true)
         #expect(workerPrompts.value.last?.contains("agenthub-mask") == false)
-        #expect(try String(contentsOf: project.appendingPathComponent("main.swift"), encoding: .utf8) == "decoded code")
+        #expect(try String(contentsOf: project.appendingPathComponent("Sources/main.swift"), encoding: .utf8) == "decoded code")
     }
 
     @Test func testRunnerFakeExecLeakedToken() throws {
@@ -186,5 +191,147 @@ struct MaskedTests {
         #expect(finalJob.offload == false)
         #expect(finalJob.note?.contains("orig") == true)
         #expect(try String(contentsOf: paths.root.appendingPathComponent("main.swift"), encoding: .utf8) == "original code")
+    }
+
+    @Test func testRunnerFakeExecMissingBriefRecovery() throws {
+        let s = snapshot()
+        let paths = HubPaths(root: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hub-\(UUID().uuidString)"))
+        try? FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
+
+        let runner = Runner(paths: paths, config: s.config)
+        let project = paths.root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+
+        var job = Job(project: project.path, objective: "obj", allowedFiles: ["main.swift"], checkArgv: ["sh", "test.sh"], size: .hard, kind: .implement, privacy: .project, created: now)
+        job.broker = "m1"
+        try? "original code".write(to: project.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+        try "exit 0\n".write(to: project.appendingPathComponent("test.sh"), atomically: true, encoding: .utf8)
+        for argv in [["git", "init", "-q"], ["git", "add", "-A"], ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]] {
+            _ = Proc.run(argv, cwd: project.path)
+        }
+
+        var maskAttempts = 0
+        let workerPrompts = Box<[String]>([])
+        runner.exec = { argv, cwd, env, stdin, timeout, pidCallback, onOutput in
+            let dir = cwd ?? ""
+            if argv.contains(where: { $0 == "m1" }) {
+                let prompt = stdin ?? ""
+                if prompt.contains("MASK step") {
+                    maskAttempts += 1
+                    let filesDir = URL(fileURLWithPath: dir).appendingPathComponent("files")
+                    try? "masked code".write(to: filesDir.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+
+                    if maskAttempts == 1 {
+                        // First attempt: skip writing valid files to trigger recovery
+                        try? "   \n  \t ".write(to: URL(fileURLWithPath: dir).appendingPathComponent("brief.md"), atomically: true, encoding: .utf8)
+                        try? "{\"placeholders\":{\"P1\":\"orig\"},\"files\":{}}".write(to: URL(fileURLWithPath: dir).appendingPathComponent("map.json"), atomically: true, encoding: .utf8)
+                        try? "[\"\"]".write(to: URL(fileURLWithPath: dir).appendingPathComponent("check.json"), atomically: true, encoding: .utf8)
+                    } else {
+                        // Second attempt: write it correctly
+                        try? "generic brief".write(to: URL(fileURLWithPath: dir).appendingPathComponent("brief.md"), atomically: true, encoding: .utf8)
+                        try? "{\"placeholders\":{\"P1\":\"orig\"},\"files\":{\"main.swift\":\"main.swift\"}}".write(to: URL(fileURLWithPath: dir).appendingPathComponent("map.json"), atomically: true, encoding: .utf8)
+                        try? "[\"sh\",\"check.sh\"]".write(to: URL(fileURLWithPath: dir).appendingPathComponent("check.json"), atomically: true, encoding: .utf8)
+                    }
+                } else if prompt.contains("DECODE step") {
+                    try? "decoded code".write(to: URL(fileURLWithPath: dir).appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+                }
+                return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "broker ok")
+            } else if argv.contains(where: { $0 == "m2" }) {
+                workerPrompts.value.append(stdin ?? "")
+                try? "edited code".write(to: URL(fileURLWithPath: dir).appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+                return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "worker ok")
+            } else if argv.last == "check.sh" || argv == ["sh", "test.sh"] {
+                return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "check ok")
+            }
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "ok")
+        }
+
+        let finalJob = runner.start(job, worker: s.config.model("m2")!, now: now)
+        #expect(finalJob.state == .verified)
+        #expect(maskAttempts == 2)
+        #expect(workerPrompts.value.count == 1) // Heavy worker ran successfully
+    }
+
+    @Test func testRunnerFakeExecUnsuccessfulRecovery() throws {
+        let s = snapshot()
+        let paths = HubPaths(root: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hub-\(UUID().uuidString)"))
+        try? FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
+        let runner = Runner(paths: paths, config: s.config)
+        let project = paths.root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+
+        var job = Job(project: project.path, objective: "obj", allowedFiles: ["main.swift"], checkArgv: ["sh", "test.sh"], size: .hard, kind: .implement, privacy: .project, created: now)
+        job.broker = "m1"
+        try? "original code".write(to: project.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+        try "exit 0\n".write(to: project.appendingPathComponent("test.sh"), atomically: true, encoding: .utf8)
+        for argv in [["git", "init", "-q"], ["git", "add", "-A"], ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]] {
+            _ = Proc.run(argv, cwd: project.path)
+        }
+
+        var workerExecuted = false
+        runner.exec = { argv, cwd, env, stdin, timeout, pidCallback, onOutput in
+            if argv.contains(where: { $0 == "m1" }) {
+                // Always fail to write brief.md
+                let dir = cwd ?? ""
+                let filesDir = URL(fileURLWithPath: dir).appendingPathComponent("files")
+                try? "{\"placeholders\":{\"P1\":\"orig\"},\"files\":{\"main.swift\":\"main.swift\"}}".write(to: URL(fileURLWithPath: dir).appendingPathComponent("map.json"), atomically: true, encoding: .utf8)
+                try? "[\"sh\",\"check.sh\"]".write(to: URL(fileURLWithPath: dir).appendingPathComponent("check.json"), atomically: true, encoding: .utf8)
+                try? "masked code".write(to: filesDir.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+                return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "broker ok")
+            } else if argv.contains(where: { $0 == "m2" }) {
+                workerExecuted = true
+                return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "worker ok")
+            }
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "ok")
+        }
+
+        let finalJob = runner.start(job, worker: s.config.model("m2")!, now: now)
+        #expect(finalJob.state == .queued) // fallbackMasked
+        #expect(finalJob.offload == false)
+        #expect(!workerExecuted)
+        #expect(finalJob.note?.contains("brief.md missing") == true)
+    }
+
+    @Test func testCancellationDuringMaskRepair() throws {
+        let s = snapshot()
+        let paths = HubPaths(root: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hub-\(UUID().uuidString)"))
+        try? FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
+
+        let runner = Runner(paths: paths, config: s.config)
+        let project = paths.root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+
+        var job = Job(project: project.path, objective: "obj", allowedFiles: ["main.swift"], checkArgv: ["sh", "test.sh"], size: .hard, kind: .implement, privacy: .project, created: now)
+        job.broker = "m1"
+        try? "original code".write(to: project.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+        let store = JobStore(paths: paths)
+        try! store.enqueue(job)
+        let queuedJob = store.active().first!
+
+        var maskAttempts = 0
+        runner.exec = { argv, cwd, env, stdin, timeout, pidCallback, onOutput in
+            let dir = cwd ?? ""
+            if argv.contains(where: { $0 == "m1" }) {
+                let prompt = stdin ?? ""
+                if prompt.contains("MASK step") {
+                    maskAttempts += 1
+                    let filesDir = URL(fileURLWithPath: dir).appendingPathComponent("files")
+                    try? "masked code".write(to: filesDir.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+                    if maskAttempts == 1 {
+                        // First attempt: invalid artifacts
+                        try? "".write(to: URL(fileURLWithPath: dir).appendingPathComponent("brief.md"), atomically: true, encoding: .utf8)
+                    } else {
+                        // Second attempt (repair): Cancel it!
+                        runner.cancel(queuedJob.id) // This updates state to .cancelled in store
+                    }
+                }
+                return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "broker ok")
+            }
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "ok")
+        }
+
+        let finalJob = runner.start(queuedJob, worker: s.config.model("m2")!, now: now)
+        #expect(finalJob.state == .cancelled)
+        #expect(maskAttempts == 2)
     }
 }
