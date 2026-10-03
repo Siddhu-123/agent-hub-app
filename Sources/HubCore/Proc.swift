@@ -28,7 +28,7 @@ public enum Proc {
         let buffer = OutputBuffer(keep: keep)
         out.fileHandleForReading.readabilityHandler = { h in
             let d = h.availableData
-            guard !d.isEmpty else { return }
+            guard !d.isEmpty else { h.readabilityHandler = nil; return }
             buffer.append(d)
             onOutput?(d)
         }
@@ -98,7 +98,35 @@ public enum Proc {
 
     /// Replaces {placeholders} in each argument. Unknown placeholders are left as is.
     public static func fill(_ template: [String], _ values: [String: String]) -> [String] {
-        template.map { arg in values.reduce(arg) { $0.replacingOccurrences(of: "{\($1.key)}", with: $1.value) } }
+        return template.map { arg in
+            var result = ""
+            var i = arg.startIndex
+            while i < arg.endIndex {
+                if arg[i] == "{" {
+                    var j = arg.index(after: i)
+                    while j < arg.endIndex && arg[j] != "}" && arg[j] != "{" {
+                        j = arg.index(after: j)
+                    }
+                    if j < arg.endIndex && arg[j] == "}" {
+                        let keyStart = arg.index(after: i)
+                        let key = String(arg[keyStart..<j])
+                        if let value = values[key] {
+                            result.append(value)
+                        } else {
+                            result.append(contentsOf: arg[i...j])
+                        }
+                        i = arg.index(after: j)
+                    } else {
+                        result.append("{")
+                        i = arg.index(after: i)
+                    }
+                } else {
+                    result.append(arg[i])
+                    i = arg.index(after: i)
+                }
+            }
+            return result
+        }
     }
 }
 
