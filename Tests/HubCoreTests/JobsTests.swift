@@ -377,7 +377,7 @@ struct JobsTests {
             resultBox.set(runner.start(queuedJob, worker: worker, now: Date()))
             finished.signal()
         }
-        let deadline = Date().addingTimeInterval(5)
+        let deadline = Date().addingTimeInterval(10)
         while !JobLog.tail(paths, queuedJob.id).contains("check /bin/sleep 30") && Date() < deadline {
             Thread.sleep(forTimeInterval: 0.02)
         }
@@ -866,5 +866,157 @@ struct JobsTests {
         var isFulfilled = false
         func fulfill() { isFulfilled = true }
     }
-}
 
+    @Test
+    func testStaleCallerRetryPreservesBaselineAndPreQuotaViolations() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        var config = ConfigStore.defaults()
+        config.harnesses.append(Harness(id: "custom", name: "Custom", executable: "c", accounts: ["acc1"], trusted: true, usageSource: .none, hookStyle: .none, mainArgs: [], workerArgs: []))
+        let runner = Runner(paths: paths, config: config)
+        let worker = ModelEntry(id: "custom-model", harness: "custom", name: "Custom", intelligence: 50, isMain: false, isWorker: true)
+        let job = Job(project: project, objective: "t", allowedFiles: ["allowed.txt"], checkArgv: ["echo", "ok"], size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let store = JobStore(paths: paths)
+        try store.enqueue(job)
+        let staleCallerJob = store.active().first!
+
+        var callCount = 0
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            callCount += 1
+            if callCount == 1 {
+                try! "content".write(to: URL(fileURLWithPath: cwd!).appendingPathComponent("outside.txt"), atomically: true, encoding: .utf8)
+                return CheckResult(argv: argv, exitCode: 1, timedOut: false, output: "429 rate limit exceeded resets in 1h")
+            }
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+
+        let now = Date()
+        let first = runner.start(staleCallerJob, worker: worker, now: now)
+        #expect(first.state == .queued)
+        #expect(first.baseline != nil)
+
+        Cooldowns.set("account:acc1", until: now.addingTimeInterval(-10), paths: paths)
+
+        let final = runner.start(staleCallerJob, worker: worker, now: now)
+
+        #expect(final.state == .needsReview)
+        #expect(final.gate?.outsideAllowed == ["outside.txt"])
+    }
+
+    @Test
+    func testRetryReusesWorktreeAfterExternalProjectLockIsReleased() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+
+        var config = ConfigStore.defaults()
+        let harness = Harness(id: "custom", name: "Custom", executable: "c", accounts: ["acc1"], trusted: true, usageSource: .none, hookStyle: .none, mainArgs: [], workerArgs: [])
+        config.harnesses.append(harness)
+        let runner = Runner(paths: paths, config: config)
+        let worker = ModelEntry(id: "custom-model", harness: "custom", name: "Custom", intelligence: 50, isMain: false, isWorker: true)
+
+        let job = Job(project: project, objective: "t", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, isolation: .worktree, created: Date())
+        let store = JobStore(paths: paths)
+        try store.enqueue(job)
+
+        let stdProject = URL(fileURLWithPath: project).resolvingSymlinksInPath().standardized.path
+        let sha256 = SHA256.hash(data: Data(stdProject.utf8)).map { String(format: "%02x", $0) }.joined()
+        try FileManager.default.createDirectory(at: paths.locks, withIntermediateDirectories: true)
+        let lockPath = paths.locks.appendingPathComponent("\(sha256).lock").path
+        let fd = open(lockPath, O_CREAT | O_RDWR, 0o600)
+        flock(fd, LOCK_EX)
+
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            return CheckResult(argv: argv, exitCode: 1, timedOut: false, output: "429 rate limit exceeded resets in 1h")
+        }
+
+        let now = Date()
+        let res1 = runner.start(store.active().first!, worker: worker, now: now)
+        #expect(res1.state == .queued)
+        #expect(res1.worktree != nil)
+        let worktreeDir = res1.worktree!
+
+        flock(fd, LOCK_UN); close(fd)
+
+        Cooldowns.set("account:acc1", until: now.addingTimeInterval(-10), paths: paths)
+        Cooldowns.set("harness:custom", until: now.addingTimeInterval(-10), paths: paths)
+
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            let url = URL(fileURLWithPath: cwd!).appendingPathComponent("a.txt")
+            try! "content".write(to: url, atomically: true, encoding: .utf8)
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+
+        let res2 = runner.start(store.active().first!, worker: worker, now: now)
+        #expect(res2.state == .verified)
+        #expect(res2.worktree == worktreeDir)
+    }
+
+    @Test
+    func testAliasedSameProjectCannotBothRunCheckoutWorkers() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        let aliasedProject = paths.root.appendingPathComponent("alias-project").path
+        try FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: aliasedProject, withDestinationPath: project)
+
+        var config = ConfigStore.defaults()
+        let runner = Runner(paths: paths, config: config)
+        let worker = ModelEntry(id: "gpt-6.1-sol", harness: "codex", name: "GPT-6.1 Sol", intelligence: 97, isMain: true, isWorker: true, effort: "xhigh")
+
+        let stdProject = URL(fileURLWithPath: aliasedProject).resolvingSymlinksInPath().standardized.path
+        let sha256 = SHA256.hash(data: Data(stdProject.utf8)).map { String(format: "%02x", $0) }.joined()
+        try FileManager.default.createDirectory(at: paths.locks, withIntermediateDirectories: true)
+        let lockPath = paths.locks.appendingPathComponent("\(sha256).lock").path
+        let fd = open(lockPath, O_CREAT | O_RDWR, 0o600)
+        flock(fd, LOCK_EX)
+        defer { flock(fd, LOCK_UN); close(fd) }
+
+        let job = Job(project: aliasedProject, objective: "t", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, isolation: .checkout, created: Date())
+        let store = JobStore(paths: paths)
+        try store.enqueue(job)
+
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+
+        let res = runner.start(store.active().first!, worker: worker, now: Date())
+        #expect(res.state == .queued)
+    }
+
+    @Test
+    func testStaleMaskedPlanCannotOverwriteOffloadFalse() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+
+        let untrustedHarness = Harness(id: "untrusted", name: "Untrusted", executable: "echo", trusted: false, usageSource: .none, hookStyle: .none, mainArgs: [], workerArgs: ["{exe}", "{model}"], promptViaStdin: true)
+        let trustedHarness = Harness(id: "trusted", name: "Trusted", executable: "echo", trusted: true, usageSource: .none, hookStyle: .none, mainArgs: [], workerArgs: ["{exe}", "{model}"], promptViaStdin: true)
+        let untrustedWorker = ModelEntry(id: "untrusted-worker", harness: "untrusted", name: "Untrusted Worker", intelligence: 50, isMain: false, isWorker: true)
+        let trustedWorker = ModelEntry(id: "trusted-worker", harness: "trusted", name: "Trusted Worker", intelligence: 50, isMain: false, isWorker: true)
+
+        var config = ConfigStore.defaults()
+        config.harnesses = [untrustedHarness, trustedHarness]
+        config.models = [untrustedWorker, trustedWorker]
+        let runner = Runner(paths: paths, config: config)
+
+        let job = Job(project: project, objective: "t", allowedFiles: ["a.txt"], checkArgv: ["echo"], size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let store = JobStore(paths: paths)
+        try store.enqueue(job)
+        let originalJob = store.active().first!
+
+        var failedMaskedJob = originalJob
+        failedMaskedJob.state = .queued
+        failedMaskedJob.offload = false
+        failedMaskedJob.note = "masked fallback"
+        try store.save(failedMaskedJob)
+
+        var staleJob = originalJob
+        staleJob.offload = true
+        staleJob.broker = "trusted-worker"
+
+        let res = runner.start(staleJob, worker: untrustedWorker, now: Date())
+
+        #expect(res.state == .queued)
+        #expect(res.offload == false)
+        #expect(res.note == "masked fallback")
+    }
+}

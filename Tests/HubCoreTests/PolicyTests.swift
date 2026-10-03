@@ -296,4 +296,54 @@ import Foundation
         s.usage["antigravity"] = UsageReading(left: 0, source: "", coolingUntil: Date().addingTimeInterval(600))
         #expect(PolicyEngine.rebalance(s, alreadyWarned: []).isEmpty)
     }
+
+    @Test func disabledClaudeModelsNeverRoute() throws {
+        var config = ConfigStore.defaults()
+        for i in config.models.indices where config.models[i].harness == "claude" {
+            config.models[i].enabled = false
+        }
+        config.mainOrder = ["gpt-6.1-sol"]
+        let now = Date()
+        var state = Snapshot(config: config, usage: [:], sessions: [], jobs: [], now: now)
+        #expect(PolicyEngine.bestMain(state, excludingHarness: nil, planned: [:])?.id == "gpt-6.1-sol")
+        #expect(PolicyEngine.bestMain(state, excludingHarness: "codex", planned: [:]) == nil)
+        #expect(PolicyEngine.canStartMain(state, "gpt-6.1-sol").ok)
+        for model in config.models where model.harness == "claude" {
+            #expect(!PolicyEngine.canStartMain(state, model.id).ok)
+        }
+        let broker = try #require(PolicyEngine.pickBroker(state, mainModel: "gpt-6.1-sol"))
+        #expect(broker.enabled && broker.harness != "claude")
+        for size in [JobSize.tiny, .routine, .hard] {
+            for kind in [JobKind.implement, .review, .plan] {
+                for privacy in [Privacy.project, .generic] {
+                    let job = Job(project: "/tmp/test", objective: "Task", allowedFiles: ["main.swift"],
+                                  checkArgv: ["true"], size: size, kind: kind, privacy: privacy,
+                                  mainModel: "gpt-6.1-sol", created: now)
+                    let plan = try #require(PolicyEngine.plan(state, job))
+                    #expect(plan.worker.enabled && plan.worker.harness != "claude")
+                    if let broker = plan.broker { #expect(broker.enabled && broker.harness != "claude") }
+                    if size == .hard && kind == .implement && privacy == .project {
+                        #expect(plan.broker != nil)
+                    }
+                }
+            }
+        }
+        for id in ["s1", "s2"] {
+            state.sessions.append(MainSession(harness: "codex", sessionId: id, cwd: "/tmp/test",
+                                              started: now.addingTimeInterval(-100), lastSeen: now,
+                                              lastEvent: "", status: .working))
+        }
+        state.usage["codex"] = UsageReading(left: 0.25, source: "test")
+        let actions = PolicyEngine.rebalance(state, alreadyWarned: [])
+        #expect(!actions.isEmpty)
+        for action in actions {
+            switch action {
+            case .wrapUp(_, let target, _):
+                #expect(target == nil || (target!.enabled && target!.harness != "claude"))
+            case .autoHandoff(_, let target):
+                #expect(target.enabled && target.harness != "claude")
+            default: break
+            }
+        }
+    }
 }

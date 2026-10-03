@@ -55,13 +55,15 @@ public final class Runner: @unchecked Sendable {
         }
         if let current = store.get(j.id) {
             if current.state != .queued { return current }
-            if let wt = current.worktree, !wt.isEmpty { j.worktree = wt }
-            if let br = current.branch, !br.isEmpty { j.branch = br }
-            if !current.attempts.isEmpty { j.attempts = current.attempts }
+            let plannedBroker = j.broker
+            j = current
+            if plannedBroker != nil && j.offload != false {
+                j.broker = plannedBroker
+            }
         }
         guard let harness = config.harness(worker.harness) else { return j }
         
-        let stdProject = URL(fileURLWithPath: j.project).standardized.path
+        let stdProject = URL(fileURLWithPath: j.project).resolvingSymlinksInPath().standardized.path
         let projectData = Data(stdProject.utf8)
         let sha256 = SHA256.hash(data: projectData).map { String(format: "%02x", $0) }.joined()
         let lockName = sha256
@@ -83,14 +85,14 @@ public final class Runner: @unchecked Sendable {
             if j.privacy == .project && j.offload != false && (j.offload == true || config.limits.maskedOffloadSizes.contains(j.size.rawValue)) && j.kind == .implement {
                 if let brokerId = j.broker, let brokerModel = config.model(brokerId), let brokerHarness = config.harness(brokerModel.harness), brokerHarness.trusted {
                     var runDir = j.project
-                    if !lockHeld {
+                    if j.worktree != nil || !lockHeld {
                         if j.isolation == .worktree {
                             if let dir = ensureWorktree(for: &j, store: store) {
                                 runDir = dir
                             } else {
                                 return j
                             }
-                        } else {
+                        } else if !lockHeld {
                             return j
                         }
                     }
@@ -100,6 +102,9 @@ public final class Runner: @unchecked Sendable {
                 }
             }
             if j.privacy != .generic {
+                if j.privacy == .project && j.offload == false {
+                    return j
+                }
                 j.state = .failed
                 j.note = "untrusted harness only runs generic jobs"
                 try? store.save(j)
@@ -116,14 +121,14 @@ public final class Runner: @unchecked Sendable {
         }
         
         var runDir = j.project
-        if !lockHeld {
+        if j.worktree != nil || !lockHeld {
             if j.isolation == .worktree {
                 if let dir = ensureWorktree(for: &j, store: store) {
                     runDir = dir
                 } else {
                     return j
                 }
-            } else {
+            } else if !lockHeld {
                 return j // Still queued
             }
         }

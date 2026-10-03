@@ -218,6 +218,16 @@ func run() throws -> Int32 {
                 var q = final
                 q.broker = plan.broker?.id
                 final = Runner(paths: paths, config: config).start(q, worker: plan.worker, now: Date())
+                if final.state == .running {
+                    // Another process (such as the app) started the job; wait for it to become terminal (or requeued).
+                    while true {
+                        if let current = store.get(final.id), current.state != .running {
+                            final = current
+                            break
+                        }
+                        Thread.sleep(forTimeInterval: 0.1)
+                    }
+                }
                 if final.state != .queued { break }
             }
             if final.state == .queued { try printJSON(jsonObject(final)); return 3 }

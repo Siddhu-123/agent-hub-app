@@ -50,6 +50,7 @@ struct JobsView: View {
                         }
                     }
                 }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 
                 HStack {
                     Button("New job...") { isNewJob = true }

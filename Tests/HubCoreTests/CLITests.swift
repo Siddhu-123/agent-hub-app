@@ -90,6 +90,28 @@ struct CLITests {
 }
 
 extension CLITests {
+    @Test func disabledClaudeStatusRemainsUsable() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        var config = ConfigStore.defaults()
+        for i in config.models.indices where config.models[i].harness == "claude" {
+            config.models[i].enabled = false
+        }
+        config.mainOrder = ["gpt-6.1-sol"]
+        for i in config.harnesses.indices { config.harnesses[i].usageSource = .none }
+        try ConfigStore.save(config, HubPaths(root: root))
+        let ctl = URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent(".build/debug/agenthubctl").path
+        let env = ["AGENT_HUB_HOME": root.path, "AGENT_HUB_TEST": "1", "PATH": "/usr/bin:/bin"]
+        let status = Proc.run([ctl, "status", "--json"], env: env, timeout: 5)
+        #expect(status.passed)
+        let object = try #require(JSONSerialization.jsonObject(with: Data(status.output.utf8)) as? [String: Any])
+        #expect(object["usage"] is [String: Any])
+        #expect(!status.output.lowercased().contains("no main"))
+        let input = #"{"model":{"display_name":"Sample"},"rate_limits":{"five_hour":{"used_percentage":25}}}"#
+        let line = Proc.run([ctl, "statusline"], env: env, stdin: input, timeout: 5)
+        #expect(line.passed && line.output.contains("Sample") && line.output.contains("5h 25%"))
+    }
+
     @Test func hooksRouteAllPlatformsAndInvalidInput() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
