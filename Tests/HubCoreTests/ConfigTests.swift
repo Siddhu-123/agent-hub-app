@@ -161,4 +161,22 @@ import Testing
         #expect(c.mainOrder.last == "claude-sonnet-5-5")
         #expect(throws: Never.self) { try ConfigStore.validate(c) }
     }
+
+    @Test func removeModel() throws {
+        var c = ConfigStore.defaults()
+        #expect(c.model("claude-opus-5-5") != nil)
+        #expect(c.mainOrder.contains("claude-opus-5-5"))
+
+        ConfigStore.removeModel(id: "claude-opus-5-5", from: &c)
+        #expect(c.model("claude-opus-5-5") == nil)
+        #expect(!c.mainOrder.contains("claude-opus-5-5"))
+        #expect(throws: Never.self) { try ConfigStore.validate(c) }
+
+        // Removing non-main worker model
+        #expect(c.model("gpt-6-sol") != nil)
+        ConfigStore.removeModel(id: "gpt-6-sol", from: &c)
+        #expect(c.model("gpt-6-sol") == nil)
+        #expect(!c.mainOrder.contains("gpt-6-sol"))
+        #expect(throws: Never.self) { try ConfigStore.validate(c) }
+    }
 }

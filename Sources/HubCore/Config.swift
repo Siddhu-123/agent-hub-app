@@ -181,6 +181,11 @@ public enum ConfigStore {
         c.mainOrder.removeAll { $0 == entry.id }
         c.mainOrder.append(entry.id)
     }
+
+    public static func removeModel(id: String, from c: inout AppConfig) {
+        c.models.removeAll { $0.id == id }
+        c.mainOrder.removeAll { $0 == id }
+    }
 }
 
 extension AppConfig {
