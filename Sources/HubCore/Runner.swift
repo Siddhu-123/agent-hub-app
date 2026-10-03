@@ -139,6 +139,10 @@ public final class Runner: @unchecked Sendable {
         j.started = now
         var detail = ["route": j.broker != nil && !harnessTrusted(worker.harness) ? "masked" : (harnessTrusted(worker.harness) ? "direct" : "sandbox")]
         if let broker = j.broker { detail["broker"] = broker }
+        if j.baseline == nil {
+            j.baseline = snapshot(runDir)
+            j.baseHead = head(runDir)
+        }
         Activity.log("job.started", job: j.id, harness: worker.harness, model: worker.id, detail, paths: paths, now: now)
         try? store.save(j)
         
@@ -161,8 +165,8 @@ public final class Runner: @unchecked Sendable {
         var lastOutput = ""
         var workerExited = false
         var latestCooling = now.addingTimeInterval(1800)
-        let before = snapshot(runDir)
-        let baseHead = head(runDir)
+        let before = j.baseline ?? [:]
+        let baseHead = j.baseHead
         
         let role = j.kind.rawValue
         var prompt = "Role: \(role)\nObjective: \(j.objective)\nAllowed files: \(j.allowedFiles.joined(separator: ", "))\nPrivacy class: \(j.privacy.rawValue)\nAcceptance argv: \(j.checkArgv.joined(separator: " "))\nRules: only edit allowed files, do not spawn workers, do not read credentials, run the acceptance argv before finishing."
@@ -259,11 +263,21 @@ public final class Runner: @unchecked Sendable {
         if let stage {
             do {
                 _ = try Sandbox.collect(stage, into: runDir)
-            } catch { }
+            } catch {
+                j.state = .failed
+                j.note = "Sandbox.collect failed: \(error)"
+                try? store.save(j)
+                JobLog.mark(paths, j.id, "job failed")
+                return j
+            }
         }
         
         j.gate = runGate(job: j, runDir: runDir, before: before, baseHead: baseHead)
-        
+        if store.get(j.id)?.state == .cancelled {
+            JobLog.mark(paths, j.id, "job cancelled")
+            return store.get(j.id) ?? j
+        }
+
         if let g = j.gate {
             if j.kind == .implement {
                 j.state = g.passed ? .verified : .needsReview
@@ -313,16 +327,22 @@ public final class Runner: @unchecked Sendable {
         j.started = now
         var detail = ["route": j.broker != nil && !harnessTrusted(worker.harness) ? "masked" : (harnessTrusted(worker.harness) ? "direct" : "sandbox")]
         if let broker = j.broker { detail["broker"] = broker }
+        if j.baseline == nil {
+            j.baseline = snapshot(runDir)
+            j.baseHead = head(runDir)
+        }
         Activity.log("job.started", job: j.id, harness: worker.harness, model: worker.id, detail, paths: paths, now: now)
         try? store.save(j)
 
         let maskDirTemplate = "/private/tmp/agenthub-mask-XXXXXX"
         var template = Array(maskDirTemplate.utf8)
         template.append(0)
-        guard let ptr = template.withUnsafeMutableBufferPointer({ mkdtemp($0.baseAddress) }) else {
+        let maskDirPath: String? = template.withUnsafeMutableBufferPointer { b in
+            mkdtemp(b.baseAddress).map { String(cString: $0) }
+        }
+        guard let maskDir = maskDirPath else {
             return fallbackMasked(job: j, reason: "Failed to create mask dir", store: store)
         }
-        let maskDir = String(cString: ptr)
         chmod(maskDir, 0o700)
         defer { try? FileManager.default.removeItem(atPath: maskDir) }
         
@@ -460,8 +480,8 @@ public final class Runner: @unchecked Sendable {
         }
         
         // DECODE
-        let before = snapshot(runDir)
-        let baseHead = head(runDir)
+        let before = j.baseline ?? [:]
+        let baseHead = j.baseHead
         
         JobLog.mark(paths, j.id, "DECODE \(brokerHarness.id)")
         let decodePrompt = Masked.decodePrompt(job: j, runDir: runDir, maskDir: maskDir)
@@ -480,6 +500,10 @@ public final class Runner: @unchecked Sendable {
         
         // Gate
         j.gate = runGate(job: j, runDir: runDir, before: before, baseHead: baseHead)
+        if store.get(j.id)?.state == .cancelled {
+            JobLog.mark(paths, j.id, "job cancelled")
+            return store.get(j.id) ?? j
+        }
         if !decodeRes.passed {
             j.state = .needsReview
             j.note = "decode helper failed"
@@ -580,7 +604,29 @@ public final class Runner: @unchecked Sendable {
     }
     
     private func snapshot(_ runDir: String) -> [String: String] {
-        getHashes(status: Proc.run(["git", "status", "--porcelain=v1", "-uall", "-z"], cwd: runDir).output, runDir: runDir).filter { file, _ in
+        let isGit = Proc.run(["git", "rev-parse", "--is-inside-work-tree"], cwd: runDir).passed
+        var hashes: [String: String]
+        if isGit {
+            hashes = getHashes(status: Proc.run(["git", "status", "--porcelain=v1", "-uall", "-z"], cwd: runDir).output, runDir: runDir)
+        } else {
+            hashes = [:]
+            let excludedDirectories: Set<String> = [".build", "node_modules", "DerivedData"]
+            func walk(_ directory: URL, relativePath: String) {
+                guard let entries = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey], options: []) else { return }
+                for entry in entries {
+                    guard let values = try? entry.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey]), values.isSymbolicLink != true else { continue }
+                    let file = relativePath.isEmpty ? entry.lastPathComponent : "\(relativePath)/\(entry.lastPathComponent)"
+                    if values.isDirectory == true {
+                        if entry.lastPathComponent.hasPrefix(".") || excludedDirectories.contains(entry.lastPathComponent) { continue }
+                        walk(entry, relativePath: file)
+                    } else if let data = try? Data(contentsOf: entry) {
+                        hashes[file] = SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+                    }
+                }
+            }
+            walk(URL(fileURLWithPath: runDir), relativePath: "")
+        }
+        return hashes.filter { file, _ in
             let url = URL(fileURLWithPath: runDir).appendingPathComponent(file).standardizedFileURL
             // Hub log writes must not be attributed to workers when a test's hub is inside its project.
             if url.deletingLastPathComponent() == paths.logs.standardizedFileURL {
@@ -607,9 +653,16 @@ public final class Runner: @unchecked Sendable {
             changed.formUnion(diff.split(separator: "\0").map(String.init).filter { !$0.isEmpty })
         }
         JobLog.mark(paths, job.id, "check \(job.checkArgv.joined(separator: " "))")
-        let acceptance = Proc.run(job.checkArgv, cwd: runDir, timeout: 600, onOutput: { data in
+        let acceptance = Proc.run(job.checkArgv, cwd: runDir, timeout: 600, onStart: { pid in
+            self.lock.lock()
+            self.pids[job.id] = pid
+            self.lock.unlock()
+        }, onOutput: { data in
             JobLog.append(self.paths, job.id, data)
         })
+        self.lock.lock()
+        self.pids.removeValue(forKey: job.id)
+        self.lock.unlock()
 
         for f in Set(preHashes.keys).union(postHashes.keys) where preHashes[f] != postHashes[f] {
             changed.insert(f)

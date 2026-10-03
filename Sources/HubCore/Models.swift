@@ -285,6 +285,9 @@ public struct Job: Codable, Equatable, Identifiable, Sendable {
     public var offload: Bool?
     /// Trusted tier-3 model that masks and decodes a masked-pipeline job (set when the job is scheduled).
     public var broker: String?
+    /// Snapshot and git head from the first attempt, retained across quota requeues.
+    public var baseline: [String: String]?
+    public var baseHead: String?
 
     public init(id: String = UUID().uuidString.lowercased(), project: String, objective: String, allowedFiles: [String],
                 checkArgv: [String], size: JobSize, kind: JobKind, privacy: Privacy, isolation: Isolation = .checkout,

@@ -213,13 +213,15 @@ public enum Sandbox {
                     continue
                 }
                 
-                let stagedData = try? Data(contentsOf: URL(fileURLWithPath: stagedFile))
+                let stagedData = try Data(contentsOf: URL(fileURLWithPath: stagedFile))
                 let targetData = try? Data(contentsOf: URL(fileURLWithPath: targetFile))
                 
                 if stagedData != targetData {
-                    try? FileManager.default.createDirectory(at: targetParentURL, withIntermediateDirectories: true)
-                    try? FileManager.default.removeItem(atPath: targetFile)
-                    try? FileManager.default.copyItem(atPath: stagedFile, toPath: targetFile)
+                    try FileManager.default.createDirectory(at: targetParentURL, withIntermediateDirectories: true)
+                    if FileManager.default.fileExists(atPath: targetFile) {
+                        try FileManager.default.removeItem(atPath: targetFile)
+                    }
+                    try FileManager.default.copyItem(atPath: stagedFile, toPath: targetFile)
                     copiedPaths.append(file)
                 }
             }

@@ -3,6 +3,13 @@ import Foundation
 @testable import HubCore
 import CryptoKit
 
+private final class JobResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Job?
+    func set(_ value: Job) { lock.lock(); result = value; lock.unlock() }
+    func get() -> Job? { lock.lock(); defer { lock.unlock() }; return result }
+}
+
 @Suite("Jobs Tests")
 struct JobsTests {
     
@@ -101,7 +108,77 @@ struct JobsTests {
         #expect(result.state == .needsReview)
         #expect(result.gate?.outsideAllowed == ["outside.txt"])
     }
+
+    @Test
+    func testCheckoutQuotaRequeueKeepsOriginalScopeBaseline() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        var config = ConfigStore.defaults()
+        config.harnesses.append(Harness(id: "custom", name: "Custom", executable: "c", accounts: ["acc1"], trusted: true, usageSource: .none, hookStyle: .none, mainArgs: [], workerArgs: []))
+        let runner = Runner(paths: paths, config: config)
+        let worker = ModelEntry(id: "custom-model", harness: "custom", name: "Custom", intelligence: 50, isMain: false, isWorker: true)
+        let job = Job(project: project, objective: "t", allowedFiles: ["allowed.txt"], checkArgv: ["echo", "ok"], size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let store = JobStore(paths: paths)
+        try store.enqueue(job)
+        var callCount = 0
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            callCount += 1
+            if callCount == 1 {
+                try! "content".write(to: URL(fileURLWithPath: cwd!).appendingPathComponent("outside.txt"), atomically: true, encoding: .utf8)
+                return CheckResult(argv: argv, exitCode: 1, timedOut: false, output: "429 rate limit exceeded resets in 1h")
+            }
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+
+        let now = Date()
+        let first = runner.start(store.active().first!, worker: worker, now: now)
+        #expect(first.state == .queued)
+        #expect(first.baseline != nil)
+        Cooldowns.set("account:acc1", until: now.addingTimeInterval(-10), paths: paths)
+        let final = runner.start(store.active().first!, worker: worker, now: now)
+
+        #expect(final.state == .needsReview)
+        #expect(final.gate?.outsideAllowed == ["outside.txt"])
+    }
+
+    @Test
+    func testCheckoutRunOutsideAllowedInNonGitProject() throws {
+        let paths = createTempPaths()
+        let projectURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: projectURL, withIntermediateDirectories: true)
+        let project = projectURL.path
+        let runner = Runner(paths: paths, config: ConfigStore.defaults())
+        let job = Job(project: project, objective: "t", allowedFiles: ["allowed.txt"], checkArgv: ["echo", "ok"], size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let worker = ModelEntry(id: "gpt-6.1-sol", harness: "codex", name: "GPT", intelligence: 97, isMain: true, isWorker: true)
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            try! "content".write(to: URL(fileURLWithPath: cwd!).appendingPathComponent("outside.txt"), atomically: true, encoding: .utf8)
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+
+        let result = runner.start(job, worker: worker, now: Date())
+        #expect(result.state == .needsReview)
+        #expect(result.gate?.outsideAllowed == ["outside.txt"])
+    }
     
+    @Test
+    func testSandboxCollectFailureFailsJob() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        try "blocked".write(to: URL(fileURLWithPath: project).appendingPathComponent("folder"), atomically: true, encoding: .utf8)
+        let runner = Runner(paths: paths, config: ConfigStore.defaults())
+        let worker = ModelEntry(id: "fake", harness: "opencode", name: "Fake", intelligence: 50, isMain: false, isWorker: true)
+        let job = Job(project: project, objective: "t", allowedFiles: ["folder/output.txt"], checkArgv: ["echo", "ok"], size: .tiny, kind: .implement, privacy: .generic, created: Date())
+        runner.exec = { argv, cwd, _, _, _, _, _ in
+            try! "output".write(to: URL(fileURLWithPath: cwd!).appendingPathComponent("output.txt"), atomically: true, encoding: .utf8)
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+        let result = runner.start(job, worker: worker, now: Date())
+        #expect(result.state == .failed)
+        #expect(result.note?.hasPrefix("Sandbox.collect failed:") == true)
+        #expect(result.gate == nil)
+        #expect(JobLog.tail(paths, job.id).contains("job failed"))
+    }
+
     @Test
     func testLockHeldIsolation() throws {
         let paths = createTempPaths()
@@ -278,6 +355,41 @@ struct JobsTests {
         
         let res = runner.start(queuedJob, worker: worker, now: Date())
         #expect(res.state == .cancelled)
+    }
+
+    @Test
+    func testCancelStopsAcceptanceCommand() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        let runner = Runner(paths: paths, config: ConfigStore.defaults())
+        let worker = ModelEntry(id: "gpt-6.1-sol", harness: "codex", name: "GPT", intelligence: 97, isMain: true, isWorker: true)
+        let job = Job(project: project, objective: "t", allowedFiles: ["a.txt"], checkArgv: ["/bin/sleep", "30"], size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let store = JobStore(paths: paths)
+        try store.enqueue(job)
+        runner.exec = { argv, cwd, env, stdin, timeout, onStart, onOutput in
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+
+        let queuedJob = store.active().first!
+        let resultBox = JobResultBox()
+        let finished = DispatchSemaphore(value: 0)
+        DispatchQueue.global().async {
+            resultBox.set(runner.start(queuedJob, worker: worker, now: Date()))
+            finished.signal()
+        }
+        let deadline = Date().addingTimeInterval(5)
+        while !JobLog.tail(paths, queuedJob.id).contains("check /bin/sleep 30") && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.02)
+        }
+        #expect(JobLog.tail(paths, queuedJob.id).contains("check /bin/sleep 30"))
+        Thread.sleep(forTimeInterval: 0.2)
+        let cancelledAt = Date()
+        runner.cancel(queuedJob.id)
+        let waitResult = finished.wait(timeout: .now() + 5)
+
+        #expect(waitResult == .success)
+        #expect(Date().timeIntervalSince(cancelledAt) < 5)
+        #expect(resultBox.get()?.state == .cancelled)
     }
     
     @Test
