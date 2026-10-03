@@ -82,3 +82,60 @@ public enum HubTree {
 ## D. App: Tree view
 
 New sidebar item "Tree" (first, the default). The view fills the window (sidebar collapses while it is shown), with a session strip on top (All + one chip per root, status dot) and an infinite, pannable, zoomable canvas below. Nodes are window cards (title bar with traffic-light dots, role badge, model, status, elapsed; body: a dark terminal pane with the tail of the job log or the session's recent lines). Connectors are curves from parent bottom to child top; while a child is `active`, glowing pulses travel along the connector toward it. A newly started job flashes its connector. Clicking a node opens a bottom drawer with its full live log, following new output.
+
+## E. Chat transcript on main nodes
+
+Goal: a main-model card (and its drawer) shows the exact words of the conversation — the user's messages and the model's replies, verbatim — with tool calls as short dim lines.
+
+### E1. HubCore: `Sources/HubCore/Transcript.swift`
+
+```swift
+public struct ChatEntry: Equatable, Sendable {
+    public enum Role: String, Sendable { case user, assistant, tool }
+    public var role: Role
+    public var text: String
+    public init(role: Role, text: String)
+}
+public enum Transcript {
+    /// The session's transcript file. `hint` (the hook's transcript_path) wins when that file exists.
+    /// Otherwise claude: the first `<claudeRoot>/<any folder>/<sessionId>.jsonl` that exists;
+    /// codex: the newest file under `<codexRoot>` (recursive) whose name ends with "-<sessionId>.jsonl".
+    /// Other platforms or nothing found: nil. sessionId must match [A-Za-z0-9._-]{1,128}, else nil.
+    public static func locate(platform: String, sessionId: String, hint: String?,
+                              claudeRoot: URL = <home>/.claude/projects, codexRoot: URL = <home>/.codex/sessions) -> URL?
+    /// Reads the last maxBytes of the file (dropping the first partial line unless reading from offset 0) and parses it.
+    public static func entries(_ url: URL, maxBytes: Int = 400_000) -> [ChatEntry]
+    /// Parses JSONL text (one JSON object per line; invalid lines are skipped). Both formats may appear; order is kept.
+    public static func parse(_ jsonl: String) -> [ChatEntry]
+}
+```
+
+Claude lines (`type` user/assistant, content in `message.content`, a string or an array of blocks):
+- Skip lines with `isMeta == true` or `isSidechain == true`.
+- `user`: a string content, or each `text` block, becomes a user entry after removing every `<system-reminder>…</system-reminder>` span and trimming. Drop it when empty or when it starts with `<local-command-`, `<command-name>`, `<command-message>`, `<task-notification>` or `Caveat:`. `tool_result` blocks are ignored.
+- `assistant`: each `text` block becomes an assistant entry (trimmed, exact text, not clipped). Each `tool_use` block becomes a tool entry `"<name> <arg>"` where arg is the first non-empty string among input `command`, `file_path`, `pattern`, `url`, `query`, `description`, `prompt`, cut to its first line and 160 characters (`<name>` alone when none). `thinking` blocks are ignored.
+
+Codex lines:
+- `type == "event_msg"` with `payload.type == "item_completed"`, by `payload.item.type`:
+  - `UserMessage`: user entry, the `text` of its `content` items joined with "\n", trimmed.
+  - `AgentMessage`: assistant entry, same joining.
+  - `CommandExecution`: tool entry `"$ <cmd>"`; `command` is an array — when it is `[shell, "-lc", script]` (shell ending in `sh`) use the script, else join with spaces; first line, 160 characters.
+  - `McpToolCall`: tool entry `"<server>.<tool>"` plus `" — <arguments.title>"` when that is a non-empty string.
+  - `FileChange`: tool entry `"✎ "` + the last path component of each key in `changes`, sorted, joined with ", ".
+  - `Extension` with `query` string: tool entry `"search <query>"` (160 characters).
+  - Others ignored.
+- `type == "event_msg"` with `payload.type == "user_message"` / `"agent_message"` (older Codex): user / assistant entry from `payload.message`.
+- `response_item` lines are ignored (they repeat the above and contain injected instructions).
+- Consecutive identical entries (same role and text) collapse into one. Empty texts are dropped.
+
+### E2. LiveFeed / LiveSession
+- `LiveSession` gains `transcript: String?` (in the memberwise init as the last parameter, default nil).
+- In the Claude/Codex branch, the shared `context` dictionary also carries `"transcript": d["transcript_path"] ?? ""` so every event that writes context stores the path (empty strings are not written, as today).
+
+### E3. Tests: `Tests/HubCoreTests/TranscriptTests.swift`
+Cover: Claude user string, user with system-reminder only (dropped), command caveat (dropped), assistant text + tool_use, meta and sidechain skipped; Codex UserMessage, AgentMessage, CommandExecution with `-lc`, FileChange, McpToolCall, old user_message/agent_message; invalid lines; duplicate collapse; `entries` with maxBytes smaller than the file (first partial line dropped); `locate` for claude and codex with temp roots, hint precedence, invalid session id; LiveFeed stores `transcript` from a UserPromptSubmit payload.
+
+### E4. App
+- `TreeModel` locates each main node's transcript (cache the URL per session; retry locate when nil at most every 10 s) and re-parses only when the file's size or modification date changed. It publishes `chats: [String: [ChatEntry]]` keyed by node id (last 40 entries), and the drawer's full chat for a selected main node (last 400 entries).
+- A main card's terminal shows the chat: user entries in an accent colour prefixed `you › `, assistant entries in white with their full text wrapped (not one line), tool entries dim, prefixed `· `. It is bottom-anchored and clipped at the top, so the newest words are always visible. Falls back to the current activity lines when there is no transcript. Main cards are 460 × 340.
+- The drawer for a main node shows the full chat: each entry with a role label (`YOU`, the model id, or `tool`), text selectable, following new messages.
