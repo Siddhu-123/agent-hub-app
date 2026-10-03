@@ -139,3 +139,23 @@ Cover: Claude user string, user with system-reminder only (dropped), command cav
 - `TreeModel` locates each main node's transcript (cache the URL per session; retry locate when nil at most every 10 s) and re-parses only when the file's size or modification date changed. It publishes `chats: [String: [ChatEntry]]` keyed by node id (last 40 entries), and the drawer's full chat for a selected main node (last 400 entries).
 - A main card's terminal shows the chat: user entries in an accent colour prefixed `you › `, assistant entries in white with their full text wrapped (not one line), tool entries dim, prefixed `· `. It is bottom-anchored and clipped at the top, so the newest words are always visible. Falls back to the current activity lines when there is no transcript. Main cards are 460 × 340.
 - The drawer for a main node shows the full chat: each entry with a role label (`YOU`, the model id, or `tool`), text selectable, following new messages.
+
+## F. Token-driven wire blobs
+
+Blobs on a wire move only while the child node is actually receiving output, and how many there are, how fast they move, and how big and bright they look follow the real amount written.
+
+### F1. Measuring flow (TreeModel, on the background refresh queue)
+- Each refresh (1 s) samples the byte size of every active node's source file:
+  - worker / broker / check nodes: the job log `JobLog` file for `jobId` (`logs/jobs/<id>.log`); only the job's currently active node gets the job's growth;
+  - main nodes: the session transcript (the URL already located for E4);
+  - subagent nodes: the parent main session's transcript growth.
+- Growth since the previous sample, in bytes, is converted to tokens as `bytes / 4` (rounded up). A shrinking or first-seen file counts as 0.
+- `TreeModel` publishes `flows: [String: [Pulse]]` keyed by node id, where `Pulse { launched: Date; duration: Double; weight: Double }`. For a delta of `n > 0` tokens it appends `k = min(6, max(1, ceil(n / 60)))` pulses with launch times spread evenly across the next refresh interval. It also keeps a per-node running average of `n` (exponential, α = 0.3, over non-zero samples only). Each pulse's `weight` is `n / average` clamped to `0.5...1.5`. Its `duration` is `1.6 s / clamp(rate / average, 0.75, 1.5)`, so heavier bursts travel faster. Pulses older than `launched + duration` are dropped. When nothing was written, no new pulses are added.
+
+### F2. Drawing (Connectors)
+- Remove the constant, time-driven packet loop and the constantly marching dash. A wire with no pulses in flight shows only its static lit state (glow and core for active nodes, as now).
+- Each pulse is drawn as the existing packet blob at `u = smoothstep((now - launched) / duration)` (ease in and out, not linear).
+- Size and brightness vary within a 20 % range driven by the pulse's tokens: `scale = 1 + flowRange * (weight - 1)` with `flowRange = 0.2` and `weight` mapped from `0.5...1.5` (so scale and opacity stay within `0.9...1.1` of their base). Keep `flowRange` a single named constant.
+- The marching dash moves only while at least one pulse is in flight on that wire, at a speed proportional to the number of pulses in flight.
+- The `TimelineView` is paused when no wire has pulses in flight and no dispatch comet is running.
+- The dispatch comet (first activation) stays as it is.
