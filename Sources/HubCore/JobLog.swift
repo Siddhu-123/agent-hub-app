@@ -1,7 +1,7 @@
 import Foundation
 
 public enum JobLog {
-    private static let idRegex = try! NSRegularExpression(pattern: "^[A-Za-z0-9._-]{1,80}$")
+    private static let idRegex = try! NSRegularExpression(pattern: "\\A[A-Za-z0-9._-]{1,80}\\z")
 
     /// <paths.logs>/jobs/<id>.log
     public static func url(_ paths: HubPaths, _ id: String) -> URL {
@@ -72,17 +72,27 @@ public enum JobLog {
         guard readLength > 0 else { return "" }
         let offset = fileSize - UInt64(readLength)
         do {
-            try handle.seek(toOffset: offset)
-            guard let data = try handle.read(upToCount: readLength) else { return "" }
-            var slice = data
-            // If truncated (fileSize > maxBytes), advance to start at a line boundary (after the first newline)
-            if fileSize > UInt64(readLength) {
-                if let firstNewlineIndex = slice.firstIndex(of: UInt8(ascii: "\n")) {
-                    slice = slice.subdata(in: (firstNewlineIndex + 1)..<slice.endIndex)
+            if offset > 0 {
+                try handle.seek(toOffset: offset - 1)
+                guard let checkByteData = try handle.read(upToCount: 1),
+                      let prevByte = checkByteData.first else { return "" }
+                guard let data = try handle.read(upToCount: readLength) else { return "" }
+                var slice = data
+                if prevByte != UInt8(ascii: "\n") {
+                    if let firstNewlineIndex = slice.firstIndex(of: UInt8(ascii: "\n")) {
+                        slice = slice.subdata(in: (firstNewlineIndex + 1)..<slice.endIndex)
+                    } else {
+                        return ""
+                    }
                 }
+                let rawString = String(decoding: slice, as: UTF8.self)
+                return sanitize(rawString)
+            } else {
+                try handle.seek(toOffset: 0)
+                guard let data = try handle.read(upToCount: readLength) else { return "" }
+                let rawString = String(decoding: data, as: UTF8.self)
+                return sanitize(rawString)
             }
-            let rawString = String(decoding: slice, as: UTF8.self)
-            return sanitize(rawString)
         } catch {
             return ""
         }
@@ -96,14 +106,15 @@ public enum JobLog {
             return
         }
         let logFiles = entries.filter { $0.pathExtension == "log" }
-        guard logFiles.count > keep else { return }
+        let effectiveKeep = max(0, keep)
+        guard logFiles.count > effectiveKeep else { return }
 
         let sorted = logFiles.map { url -> (URL, Date) in
             let date = (try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
             return (url, date)
         }.sorted { $0.1 > $1.1 } // newest first
 
-        for (url, _) in sorted.dropFirst(keep) {
+        for (url, _) in sorted.dropFirst(effectiveKeep) {
             try? fm.removeItem(at: url)
         }
     }
