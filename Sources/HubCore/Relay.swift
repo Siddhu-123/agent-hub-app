@@ -231,6 +231,7 @@ public struct Relay: Sendable {
         let target: ModelEntry
         if let mId = modelId {
             guard let m = config.model(mId) else { throw HubError.invalid("Target model not found") }
+            guard m.isMain && m.enabled else { throw HubError.invalid("Target model is not a main model or is disabled") }
             target = m
         } else {
             let snapshot = Snapshot(config: config, usage: measuredUsage(now: now), sessions: sessions(now: now), jobs: [], now: now)
@@ -273,11 +274,15 @@ public struct Relay: Sendable {
         try scriptText.write(to: scriptFile, atomically: true, encoding: .utf8)
         try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: scriptFile.path)
 
+        var launched = false
         if launch {
-            _ = openScript(scriptFile)
+            launched = openScript(scriptFile)
+            if !launched {
+                throw HubError.invalid("Failed to open handoff script")
+            }
         }
 
-        let record = HandoffRecord(id: id, fromHarness: harness, fromSession: session, toModel: target.id, project: project, file: resolvedFile, script: scriptFile.path, launched: launch, automatic: automatic, created: now)
+        let record = HandoffRecord(id: id, fromHarness: harness, fromSession: session, toModel: target.id, project: project, file: resolvedFile, script: scriptFile.path, launched: launched, automatic: automatic, created: now)
         try FileStore.write(record, to: paths.handoffs.appendingPathComponent("\(id).json"))
 
         if let sid = session {

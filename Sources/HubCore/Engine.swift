@@ -269,8 +269,8 @@ import Combine
         let check = canStartMain(modelId)
         if !check.ok { throw HubError.noCapacity(check.reason) }
 
-        let unix = Int(Date().timeIntervalSince1970)
-        let file = paths.handoffs.appendingPathComponent("start-\(unix).md")
+        let id = UUID().uuidString.lowercased()
+        let file = paths.handoffs.appendingPathComponent("start-\(id).md")
         let content = "# New main session\nProject: \(project)\nStart fresh; read the project's README/AGENTS.md first."
         try FileManager.default.createDirectory(at: paths.handoffs, withIntermediateDirectories: true)
         try content.write(to: file, atomically: true, encoding: .utf8)

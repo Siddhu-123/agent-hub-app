@@ -192,7 +192,7 @@ final class Box<T: Sendable>: @unchecked Sendable {
     
     @Test func applyAutoHandoffWritesMarkdownAndInterrupts() throws {
         let interruptedPid = Box<Int32?>(nil)
-        let relay = Relay(paths: paths, config: config, ctlPath: "ctl", interrupt: { pid in
+        let relay = Relay(paths: paths, config: config, ctlPath: "ctl", openScript: { _ in true }, interrupt: { pid in
             interruptedPid.value = pid
         })
         let now = Date()
@@ -219,5 +219,71 @@ final class Box<T: Sendable>: @unchecked Sendable {
         let relay = Relay(paths: paths, config: config, ctlPath: "ctl")
         let out = relay.hook("claude", event: "UserPromptSubmit", payload: ["garbage": true], env: [:], now: Date())
         #expect(out == nil)
+    }
+
+    @Test func handoffFailsIfOpenScriptFails() throws {
+        let openScriptFailed = Box<Bool>(false)
+        let relay = Relay(paths: paths, config: config, ctlPath: "ctl", openScript: { _ in
+            openScriptFailed.value = true
+            return false
+        })
+
+        let projectPath = tmpDir.appendingPathComponent("proj_openscript_fail")
+        try FileManager.default.createDirectory(at: projectPath, withIntermediateDirectories: true)
+
+        let handoffFile = projectPath.appendingPathComponent("handoff.md")
+        try "handoff content".write(to: handoffFile, atomically: true, encoding: .utf8)
+
+        // start session
+        _ = relay.hook("claude", event: "SessionStart", payload: ["session_id": "sid_openscript"], env: [:], now: Date())
+
+        #expect(throws: HubError.self) {
+            _ = try relay.handoff(from: "claude", session: "sid_openscript", project: projectPath.path, file: handoffFile.path, to: "gpt-6.1-sol", launch: true, automatic: false, now: Date())
+        }
+
+        // Verify session is not marked handed off
+        let s = relay.sessions(activeOnly: false, now: Date()).first { $0.sessionId == "sid_openscript" }
+        #expect(s?.handedOff == false)
+
+        // Verify openScript was called
+        #expect(openScriptFailed.value)
+    }
+
+    @Test func handoffRejectsNonMainModel() throws {
+        let relay = Relay(paths: paths, config: config, ctlPath: "ctl")
+
+        let projectPath = tmpDir.appendingPathComponent("proj_nonmain")
+        try FileManager.default.createDirectory(at: projectPath, withIntermediateDirectories: true)
+
+        let handoffFile = projectPath.appendingPathComponent("handoff.md")
+        try "handoff content".write(to: handoffFile, atomically: true, encoding: .utf8)
+
+        // Try to handoff to a worker-only model
+        let workerOnlyModel = ModelEntry(id: "worker-only", harness: "claude", name: "Worker Only", intelligence: 50, isMain: false, isWorker: true)
+        let configWithWorker = AppConfig(harnesses: config.harnesses, models: config.models + [workerOnlyModel], mainOrder: config.mainOrder)
+        let relayWithWorker = Relay(paths: paths, config: configWithWorker, ctlPath: "ctl")
+
+        #expect(throws: HubError.self) {
+            _ = try relayWithWorker.handoff(from: "claude", session: nil, project: projectPath.path, file: handoffFile.path, to: "worker-only", launch: false, automatic: false, now: Date())
+        }
+    }
+
+    @Test func handoffRejectsDisabledModel() throws {
+        let relay = Relay(paths: paths, config: config, ctlPath: "ctl")
+
+        let projectPath = tmpDir.appendingPathComponent("proj_disabled")
+        try FileManager.default.createDirectory(at: projectPath, withIntermediateDirectories: true)
+
+        let handoffFile = projectPath.appendingPathComponent("handoff.md")
+        try "handoff content".write(to: handoffFile, atomically: true, encoding: .utf8)
+
+        // Create a config with a disabled main model
+        let disabledModel = ModelEntry(id: "disabled-main", harness: "claude", name: "Disabled Main", intelligence: 99, isMain: true, isWorker: false, enabled: false)
+        let configWithDisabled = AppConfig(harnesses: config.harnesses, models: config.models + [disabledModel], mainOrder: config.mainOrder)
+        let relayWithDisabled = Relay(paths: paths, config: configWithDisabled, ctlPath: "ctl")
+
+        #expect(throws: HubError.self) {
+            _ = try relayWithDisabled.handoff(from: "claude", session: nil, project: projectPath.path, file: handoffFile.path, to: "disabled-main", launch: false, automatic: false, now: Date())
+        }
     }
 }

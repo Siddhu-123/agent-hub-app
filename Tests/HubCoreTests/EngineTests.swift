@@ -100,4 +100,46 @@ struct EngineTests {
         engine.cancel(jobId: storedJob2.id)
         #expect(engine.jobs.first(where: { $0.id == storedJob2.id })?.state == .cancelled)
     }
+
+    @Test
+    func testStartMainUsesUUIDNotUnixTimestamp() async throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+
+        var openScriptUrls: [URL] = []
+        let openScript: @Sendable (URL) -> Bool = { url in
+            openScriptUrls.append(url)
+            return true
+        }
+
+        let engine = Engine(paths: paths, ctlPath: "/bin/ctl", openScript: openScript)
+
+        let config = AppConfig(
+            harnesses: [
+                Harness(id: "h1", name: "H1", executable: "exe", accounts: [], trusted: true, usageSource: .none, hookStyle: .none, mainArgs: ["{prompt}"], workerArgs: ["{prompt}"])
+            ],
+            models: [
+                ModelEntry(id: "m1", harness: "h1", name: "M1", intelligence: 100, isMain: true, isWorker: true)
+            ],
+            mainOrder: ["m1"]
+        )
+        try engine.saveConfig(config)
+
+        // Call startMain twice in quick succession
+        try engine.startMain(modelId: "m1", project: project)
+        let filesAfterFirst = try FileManager.default.contentsOfDirectory(atPath: paths.handoffs.path)
+
+        try engine.startMain(modelId: "m1", project: project)
+        let filesAfterSecond = try FileManager.default.contentsOfDirectory(atPath: paths.handoffs.path)
+
+        // Extract start file names
+        let startFiles = filesAfterSecond.filter { $0.hasPrefix("start-") && $0.hasSuffix(".md") }
+        #expect(startFiles.count >= 2, "Expected at least 2 start files, got \(startFiles.count)")
+
+        // Verify the files have different names (UUIDs)
+        if startFiles.count >= 2 {
+            let names = Set(startFiles)
+            #expect(names.count == startFiles.count, "Start file names should be unique; got duplicates in \(startFiles)")
+        }
+    }
 }
