@@ -30,9 +30,7 @@ public enum HubTree {
     private static func path(_ value: String) -> String { URL(fileURLWithPath: value).standardizedFileURL.path }
 
     public static func build(sessions: [LiveSession], jobs: [Job], modelHarness: [String: String], now: Date) -> [HubNode] {
-        let eligibleJobs = jobs.filter { job in
-            job.state == .queued || job.state == .running || job.finished.map { let age = now.timeIntervalSince($0); return age >= 0 && age <= 1800 } == true
-        }
+        let eligibleJobs = jobs.filter { $0.state == .queued || $0.state == .running }
         var owners: [String: String] = [:]
         for job in eligibleJobs {
             if let parent = job.parentSession,

@@ -32,6 +32,78 @@ import Testing
         #expect(secondLoad.config == ConfigStore.defaults())
     }
 
+    @Test func brokerEligibilityRoundTripsAndLegacyConfigsKeepRangeDefaults() throws {
+        var config = ConfigStore.defaults()
+        let lunaIndex = try #require(config.models.firstIndex { $0.id == "gpt-6-luna" })
+        config.models[lunaIndex].brokerEligible = true
+        let encoded = try JSONCoding.encoder.encode(config)
+        let roundTripped = try JSONCoding.decoder.decode(AppConfig.self, from: encoded)
+        #expect(roundTripped.model("gpt-6-luna")?.brokerEligible == true)
+
+        // Simulate a config written before per-model broker eligibility existed.
+        var legacyObject = try #require(JSONSerialization.jsonObject(with: JSONCoding.encoder.encode(ConfigStore.defaults())) as? [String: Any])
+        var legacyModels = try #require(legacyObject["models"] as? [[String: Any]])
+        legacyModels = legacyModels.map { model in
+            var oldModel = model
+            oldModel.removeValue(forKey: "brokerEligible")
+            return oldModel
+        }
+        legacyObject["models"] = legacyModels
+        let legacyData = try JSONSerialization.data(withJSONObject: legacyObject)
+        let legacy = try JSONCoding.decoder.decode(AppConfig.self, from: legacyData)
+        #expect(legacy.models.allSatisfy { $0.brokerEligible == nil })
+        #expect(legacy.limits.brokerMinIntelligence == 55)
+        #expect(legacy.limits.brokerMaxIntelligence == 79)
+        #expect((legacy.model("gpt-6-luna")?.brokerEligible ?? false) == false)
+        #expect(legacy.model("claude-haiku-4-5-20251001")?.brokerEligible == nil)
+    }
+
+    @Test func sameRawIDCoexistsAcrossHarnessesAndRoundTrips() throws {
+        var config = ConfigStore.defaults()
+        let antigravity = ModelEntry(id: "claude-opus-5-5", harness: "antigravity", name: "Agy Opus", intelligence: 80,
+                                     isMain: false, isWorker: true, enabled: false)
+        ConfigStore.upsertModel(antigravity, in: &config)
+        try ConfigStore.validate(config)
+
+        let paths = HubPaths(root: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        defer { try? FileManager.default.removeItem(at: paths.root) }
+        try ConfigStore.save(config, paths)
+        let (loaded, warning) = ConfigStore.load(paths)
+        #expect(warning == nil)
+        #expect(loaded.model("claude/claude-opus-5-5")?.harness == "claude")
+        #expect(loaded.model("antigravity/claude-opus-5-5")?.enabled == false)
+        #expect(loaded.models.filter { $0.id == "claude-opus-5-5" }.count == 2)
+    }
+
+    @Test func ambiguousRawModelNeedsQualificationAndOpenCodeSlashIsPreserved() throws {
+        var config = ConfigStore.defaults()
+        ConfigStore.upsertModel(ModelEntry(id: "claude-opus-5-5", harness: "antigravity", name: "Agy Opus", intelligence: 80,
+                                           isMain: false, isWorker: true), in: &config)
+        #expect(config.model("claude-opus-5-5") == nil)
+        #expect(throws: HubError.self) { try config.resolveModel("claude-opus-5-5") }
+        #expect(try config.resolveModel("claude-opus-5-5", preferredHarness: "claude").harness == "claude")
+        #expect(config.model("opencode/big-pickle")?.id == "opencode/big-pickle")
+        #expect(config.model("opencode/opencode/big-pickle")?.id == "opencode/big-pickle")
+        #expect(ModelIdentity.parse("opencode/opencode/space-bunny-free", knownHarnesses: Set(config.harnesses.map(\.id)))?.id == "opencode/space-bunny-free")
+    }
+
+    @Test func loadRestoresMissingClaudeDefaultWithoutChangingAntigravityEntry() throws {
+        var config = ConfigStore.defaults()
+        config.models.removeAll { $0.harness == "claude" && $0.id == "claude-opus-5-5" }
+        config.mainOrder.removeAll { $0 == "claude-opus-5-5" }
+        let agy = ModelEntry(id: "claude-opus-5-5", harness: "antigravity", name: "Agy Opus", intelligence: 80,
+                             isMain: false, isWorker: true, enabled: false)
+        ConfigStore.upsertModel(agy, in: &config)
+        let paths = HubPaths(root: FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString))
+        defer { try? FileManager.default.removeItem(at: paths.root) }
+        try ConfigStore.save(config, paths)
+
+        let (loaded, warning) = ConfigStore.load(paths)
+        #expect(warning == nil)
+        #expect(loaded.model("claude/claude-opus-5-5")?.isMain == true)
+        #expect(loaded.model("antigravity/claude-opus-5-5")?.enabled == false)
+    }
+
     @Test func undecodableFileIsBackedUpAndWarningReturned() throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: tempDir) }
@@ -160,6 +232,12 @@ import Testing
         #expect(updated.isMain == true)
         #expect(c.mainOrder.last == "claude-sonnet-5-5")
         #expect(throws: Never.self) { try ConfigStore.validate(c) }
+
+        let antigravityTwin = ModelEntry(id: "claude-sonnet-5-5", harness: "antigravity", name: "Agy Sonnet", intelligence: 50,
+                                         isMain: false, isWorker: true, enabled: false)
+        ConfigStore.upsertModel(antigravityTwin, in: &c)
+        #expect(c.model("claude/claude-sonnet-5-5")?.isMain == true)
+        #expect(c.model("antigravity/claude-sonnet-5-5")?.enabled == false)
     }
 
     @Test(arguments: [0.0, -1.0, Double.infinity, Double.nan])

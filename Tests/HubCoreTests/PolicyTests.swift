@@ -29,6 +29,16 @@ import Foundation
         return c
     }
     
+    @Test func freeWorkerBeatsCrossHarnessPaidWorkerForGenericJobs() {
+        var c = makeConfig()
+        c.models.append(ModelEntry(id: "opencode/free-60", harness: "opencode", name: "Free 60", intelligence: 60, isMain: false, isWorker: true, free: true))
+        let s = Snapshot(config: c, usage: [:], sessions: [], jobs: [], now: Date())
+        // Main is Claude: before, the Codex worker won on harness; a free OpenCode model now goes first.
+        #expect(PolicyEngine.pickWorker(s, .routine, .implement, .generic, mainModel: "claude-opus-5-5")?.id == "opencode/free-60")
+        // Project jobs still never go to an untrusted free model directly.
+        #expect(PolicyEngine.pickWorker(s, .routine, .implement, .project, mainModel: "claude-opus-5-5")?.free != true)
+    }
+
     @Test func bands() {
         var s = Snapshot(config: makeConfig(), usage: [:], sessions: [], jobs: [], now: Date())
         #expect(PolicyEngine.band(s, "claude") == .healthy) // unknown
@@ -295,6 +305,57 @@ import Foundation
         var s = Snapshot(config: makeConfig(), usage: [:], sessions: [], jobs: [], now: Date())
         s.usage["antigravity"] = UsageReading(left: 0, source: "", coolingUntil: Date().addingTimeInterval(600))
         #expect(PolicyEngine.rebalance(s, alreadyWarned: []).isEmpty)
+    }
+
+    @Test func brokerEligibilityCanIncludeLunaButStillRequiresTrustedEnabledWorker() throws {
+        var config = makeConfig()
+        var state = Snapshot(config: config, usage: [:], sessions: [], jobs: [], now: Date())
+
+        // A config without per-model values keeps the old 55...79 broker set.
+        #expect(PolicyEngine.pickBroker(state, mainModel: "gpt-6.1-sol")?.id == "gemini-3.8-flash-low")
+
+        let lunaIndex = try #require(config.models.firstIndex { $0.id == "gpt-6-luna" })
+        config.models[lunaIndex].brokerEligible = true
+        let legacyBrokerIndex = try #require(config.models.firstIndex { $0.id == "gemini-3.8-flash-low" })
+        config.models[legacyBrokerIndex].brokerEligible = false
+        state.config = config
+        #expect(PolicyEngine.pickBroker(state, mainModel: "gpt-6.1-sol")?.id == "gpt-6-luna")
+
+        // An explicit selection cannot make disabled models, non-workers, or untrusted workers eligible.
+        let opusIndex = try #require(config.models.firstIndex { $0.id == "claude-opus-5-5" })
+        config.models[opusIndex].brokerEligible = true
+        let sonnetIndex = try #require(config.models.firstIndex { $0.id == "claude-sonnet-5-5" })
+        config.models[sonnetIndex].brokerEligible = true
+        config.models[sonnetIndex].enabled = false
+        let openCodeIndex = try #require(config.models.firstIndex { $0.id == "opencode/big-pickle" })
+        config.models[openCodeIndex].brokerEligible = true
+        let lunaModelIndex = try #require(config.models.firstIndex { $0.id == "gpt-6-luna" })
+        config.models[lunaModelIndex].enabled = false
+        state.config = config
+        #expect(PolicyEngine.pickBroker(state, mainModel: "gpt-6.1-sol") == nil)
+
+        config.harnesses.append(Harness(id: "antigravity", name: "Antigravity", executable: "antigravity", trusted: true,
+                                        usageSource: .manual, hookStyle: .none, mainArgs: [], workerArgs: []))
+        config.models.append(ModelEntry(id: "disabled-gemini", harness: "antigravity", name: "Disabled Gemini", intelligence: 75,
+                                        isMain: false, isWorker: true, enabled: false, brokerEligible: true))
+        state.config = config
+        #expect(PolicyEngine.pickBroker(state, mainModel: "gpt-6.1-sol") == nil)
+    }
+
+    @Test func explicitlyRequestedWorkerResolvesByQualifiedIdentity() throws {
+        var config = makeConfig()
+        let agy = Harness(id: "antigravity", name: "Antigravity", executable: "agy", trusted: true,
+                          usageSource: .manual, hookStyle: .none, mainArgs: [], workerArgs: [])
+        config.harnesses.append(agy)
+        config.models.append(ModelEntry(id: "gpt-6-luna", harness: "antigravity", name: "Agy Luna", intelligence: 80,
+                                        isMain: false, isWorker: true, enabled: false))
+        let snapshot = Snapshot(config: config, usage: [:], sessions: [], jobs: [], now: Date())
+        let job = Job(project: "/tmp", objective: "pin worker", allowedFiles: ["a"], checkArgv: ["true"], size: .tiny,
+                      kind: .implement, privacy: .project, mainModel: "codex/gpt-6.1-sol",
+                      requestedWorker: "antigravity/gpt-6-luna", created: Date())
+        let plan = try #require(PolicyEngine.plan(snapshot, job))
+        #expect(plan.worker.harness == "antigravity")
+        #expect(plan.worker.id == "gpt-6-luna")
     }
 
     @Test func disabledClaudeModelsNeverRoute() throws {

@@ -39,6 +39,7 @@ import Combine
     private let interrupt: (@Sendable (Int32) -> Void)?
 
     private var inFlight: Set<String> = []
+    private var configFileData: Data?
 
     private lazy var runner: Runner = {
         let r = Runner(paths: paths, config: config)
@@ -57,6 +58,7 @@ import Combine
         let loaded = ConfigStore.load(paths)
         self.config = loaded.config
         self.configWarning = loaded.warning
+        self.configFileData = try? Data(contentsOf: paths.config)
         self.hookStatus = HookInstaller(ctlPath: ctlPath).status()
     }
 
@@ -148,7 +150,8 @@ import Combine
 
     public func snapshot(now: Date = Date()) -> Snapshot {
         Snapshot(config: config, usage: usage, sessions: sessions,
-                 jobs: jobs.filter { $0.state == .queued || $0.state == .running }, now: now)
+                 jobs: jobs.filter { $0.state == .queued || $0.state == .running }, now: now,
+                 cooldowns: Cooldowns.active(paths: paths, now: now))
     }
 
     public func band(_ harness: String) -> Band { PolicyEngine.band(snapshot(), harness) }
@@ -158,6 +161,7 @@ import Combine
 
     /// One policy cycle (SPEC §7 tick). schedule: false skips starting queued jobs (used by `agenthubctl tick`). ENGINE WORKER.
     public func tick(now: Date = Date(), schedule: Bool = true) {
+        reloadConfig()
         usage = UsageMeter(paths: paths).read(config, now: now)
         Activity.usage(usage, paths: paths, now: now)
 
@@ -176,6 +180,8 @@ import Combine
         let warnedSet = Set(sessions.compactMap { $0.warned != nil ? $0.id : nil })
         let actions = PolicyEngine.rebalance(snapshot(now: now), alreadyWarned: warnedSet)
         appendLog(rel.apply(actions, now: now), now: now)
+        appendLog(rel.noticeResets(snapshot(now: now), now: now), now: now)
+        appendLog(rel.closeFinished(now: now), now: now)
         sessions = rel.sessions(activeOnly: true, now: now)
 
         if schedule {
@@ -188,6 +194,14 @@ import Combine
                 if runningCount >= config.limits.maxJobs { break }
 
                 guard let plan = PolicyEngine.plan(snap, job) else {
+                    // Say why the job waits instead of leaving it silently queued.
+                    let why = PolicyEngine.whyQueued(snap, job).reason
+                    let store = JobStore(paths: paths)
+                    if job.note != why, var stored = store.get(job.id), stored.state == .queued {
+                        stored.note = why
+                        try? store.save(stored)
+                        if let i = jobs.firstIndex(where: { $0.id == job.id }) { jobs[i].note = why }
+                    }
                     break
                 }
                 let worker = plan.worker
@@ -197,11 +211,11 @@ import Combine
                 if let i = jobs.firstIndex(where: { $0.id == job.id }) {
                     jobs[i].state = .running
                     jobs[i].harness = worker.harness
-                    jobs[i].model = worker.id
-                    jobs[i].broker = plan.broker?.id
+                    jobs[i].model = worker.qualifiedID
+                    jobs[i].broker = plan.broker?.qualifiedID
                 }
                 var startJob = job
-                startJob.broker = plan.broker?.id
+                startJob.broker = plan.broker?.qualifiedID
                 let r = runner
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     let finalJob = r.start(startJob, worker: worker, now: Date())
@@ -259,7 +273,15 @@ import Combine
     /// Validates, enqueues and ticks. Returns the stored job. ENGINE WORKER.
     @discardableResult
     public func delegate(_ job: Job) throws -> Job {
-        let stored = try JobStore(paths: paths).enqueue(job)
+        var resolvedJob = job
+        if let main = job.mainModel {
+            let preferred = job.parentSession.flatMap { $0.split(separator: ":", maxSplits: 1).first.map(String.init) }
+            resolvedJob.mainModel = try config.mainReference(main, preferredHarness: preferred)
+        }
+        if let worker = job.requestedWorker {
+            resolvedJob.requestedWorker = try config.resolveModel(worker).qualifiedID
+        }
+        let stored = try JobStore(paths: paths).enqueue(resolvedJob)
         Activity.queued(stored, paths: paths)
         appendLog(["job queued: \(stored.id)"])
         tick()
@@ -355,6 +377,21 @@ import Combine
         configWarning = nil
         runner.config = c
         tick()
+    }
+
+    private func reloadConfig() {
+        guard let data = try? Data(contentsOf: paths.config), data != configFileData else { return }
+        configFileData = data
+        let loaded = ConfigStore.load(paths)
+        guard loaded.warning == nil else {
+            configWarning = loaded.warning
+            return
+        }
+
+        configWarning = nil
+        guard loaded.config != config else { return }
+        config = loaded.config
+        runner.config = loaded.config
     }
 
     @discardableResult

@@ -51,11 +51,33 @@ public struct ModelEntry: Codable, Hashable, Identifiable, Sendable {
     public var free: Bool
     public var effort: String?
     public var enabled: Bool
+    /// Explicit broker selection. nil preserves the intelligence-range behavior of older configs.
+    public var brokerEligible: Bool?
+    /// Zero-data-retention allowlist entry. A model counts as ZDR only with a recorded source and date.
+    public var zdr: Bool?
+    public var zdrSource: String?
+    public var zdrDate: String?
+
+    /// Who serves the model, for fan-out across providers. nil derives it from the id ("opencode/space-bunny-free" → "space").
+    public var provider: String?
+    public var providerKey: String {
+        if let p = provider, !p.isEmpty { return p.lowercased() }
+        let last = id.split(separator: "/").last.map(String.init) ?? id
+        return (last.split(separator: "-").first.map(String.init) ?? last).lowercased()
+    }
+
+    public var isZDR: Bool {
+        zdr == true && !(zdrSource ?? "").trimmingCharacters(in: .whitespaces).isEmpty && !(zdrDate ?? "").isEmpty
+    }
+
+    /// Stable identity within the model catalogue. `id` remains the raw value sent to the harness.
+    public var qualifiedID: String { "\(harness)/\(id)" }
 
     public init(id: String, harness: String, name: String, intelligence: Int, isMain: Bool, isWorker: Bool,
-                free: Bool = false, effort: String? = nil, enabled: Bool = true) {
+                free: Bool = false, effort: String? = nil, enabled: Bool = true, brokerEligible: Bool? = nil) {
         self.id = id; self.harness = harness; self.name = name; self.intelligence = intelligence
         self.isMain = isMain; self.isWorker = isWorker; self.free = free; self.effort = effort; self.enabled = enabled
+        self.brokerEligible = brokerEligible
     }
 }
 
@@ -72,6 +94,8 @@ public struct Limits: Codable, Equatable, Sendable {
     public var exhaustedAtOrBelow = 0.02
     /// Worker jobs: a harness below this gets no jobs; between this and sameHarnessMinLeft it gets at most one.
     public var workerMinLeft = 0.15
+    /// Wrap-up fires once a harness has this much or less left (0.12 = 88% used), even when wrapUpBelow is lower.
+    public var wrapUpReserve = 0.12
     public var graceSeconds = 600.0
     public var activeSeconds = 900.0
     public var maxStopBlocks = 2
@@ -86,13 +110,16 @@ public struct Limits: Codable, Equatable, Sendable {
     /// Tier 3: trusted worker models in this intelligence range may act as the mask/decode broker.
     public var brokerMinIntelligence = 55
     public var brokerMaxIntelligence = 79
+    /// Sessions the hub launched for a handoff are closed once they hand off themselves, or after this
+    /// long idle (0 = never close idle ones). Sessions the user opened are never closed.
+    public var closeIdleLaunchedSeconds = 1800.0
 
     public init() {}
 
     private enum CodingKeys: String, CodingKey {
-        case maxMainSessions, maxJobs, sameHarnessMinLeft, singleSessionBelow, wrapUpBelow, exhaustedAtOrBelow, workerMinLeft
+        case maxMainSessions, maxJobs, sameHarnessMinLeft, singleSessionBelow, wrapUpBelow, exhaustedAtOrBelow, workerMinLeft, wrapUpReserve
         case graceSeconds, activeSeconds, maxStopBlocks, jobTimeoutSeconds, minIntelligence, interruptOnAutoHandoff
-        case maskedOffloadSizes, maskedHeavyAttempts, brokerMinIntelligence, brokerMaxIntelligence
+        case maskedOffloadSizes, maskedHeavyAttempts, brokerMinIntelligence, brokerMaxIntelligence, closeIdleLaunchedSeconds
     }
 
     /// Keys missing from an older config keep their defaults instead of failing the whole file.
@@ -107,6 +134,7 @@ public struct Limits: Codable, Equatable, Sendable {
         wrapUpBelow = try v(.wrapUpBelow, d.wrapUpBelow)
         exhaustedAtOrBelow = try v(.exhaustedAtOrBelow, d.exhaustedAtOrBelow)
         workerMinLeft = try v(.workerMinLeft, d.workerMinLeft)
+        wrapUpReserve = try v(.wrapUpReserve, d.wrapUpReserve)
         graceSeconds = try v(.graceSeconds, d.graceSeconds)
         activeSeconds = try v(.activeSeconds, d.activeSeconds)
         maxStopBlocks = try v(.maxStopBlocks, d.maxStopBlocks)
@@ -117,6 +145,7 @@ public struct Limits: Codable, Equatable, Sendable {
         maskedHeavyAttempts = try v(.maskedHeavyAttempts, d.maskedHeavyAttempts)
         brokerMinIntelligence = try v(.brokerMinIntelligence, d.brokerMinIntelligence)
         brokerMaxIntelligence = try v(.brokerMaxIntelligence, d.brokerMaxIntelligence)
+        closeIdleLaunchedSeconds = try v(.closeIdleLaunchedSeconds, d.closeIdleLaunchedSeconds)
     }
 }
 
@@ -124,18 +153,67 @@ public struct AppConfig: Codable, Equatable, Sendable {
     public var schemaVersion = 1
     public var harnesses: [Harness]
     public var models: [ModelEntry]
-    /// Main model ids in preference order (tie-breaker after intelligence).
+    /// Model ids in preference order (tie-breaker after intelligence); qualified when ambiguous.
     public var mainOrder: [String]
     public var limits = Limits()
     public var autoLaunch = true
     public var terminalApp = "Terminal"
+    /// User-only (Settings window): ZDR-listed workers on untrusted harnesses may take project jobs in the sandbox.
+    /// No CLI flag sets this; agents must not edit it.
+    public var zdrProjectWorkers: Bool?
+
+    /// Project jobs may run directly (sandboxed) on this worker because the user allowed listed ZDR workers.
+    public func allowsZDRProjectJob(_ model: ModelEntry) -> Bool { zdrProjectWorkers == true && model.isZDR }
 
     public init(harnesses: [Harness], models: [ModelEntry], mainOrder: [String], limits: Limits = Limits()) {
         self.harnesses = harnesses; self.models = models; self.mainOrder = mainOrder; self.limits = limits
     }
 
     public func harness(_ id: String) -> Harness? { harnesses.first { $0.id == id } }
-    public func model(_ id: String) -> ModelEntry? { models.first { $0.id == id } }
+    public func model(_ id: String, harness preferredHarness: String? = nil) -> ModelEntry? {
+        if let preferredHarness, let local = models.first(where: { $0.harness == preferredHarness && $0.id == id }) {
+            return local
+        }
+        if let (harness, rawID) = ModelIdentity.parse(id, knownHarnesses: Set(harnesses.map(\.id))) {
+            if let qualified = models.first(where: { $0.harness == harness && $0.id == rawID }) { return qualified }
+        }
+        let matches = models.filter { $0.id == id }
+        return matches.count == 1 ? matches.first : nil
+    }
+
+    public func resolveModel(_ id: String, preferredHarness: String? = nil) throws -> ModelEntry {
+        if let model = model(id, harness: preferredHarness) { return model }
+        let matches = models.filter { $0.id == id }
+        if matches.count > 1 {
+            throw HubError.invalid("Ambiguous model '\(id)'; choose \(matches.map(\.qualifiedID).sorted().joined(separator: ", "))")
+        }
+        throw HubError.invalid("Model '\(id)' not found")
+    }
+
+    /// Main-model reference for a job: unknown ids pass through unchanged (no same-harness rule, as before);
+    /// only an ambiguous bare id is an error.
+    public func mainReference(_ id: String, preferredHarness: String? = nil) throws -> String {
+        if let model = model(id, harness: preferredHarness) { return modelReference(model) }
+        if models.filter({ $0.id == id }).count > 1 { _ = try resolveModel(id, preferredHarness: preferredHarness) }
+        return id
+    }
+
+    /// Keep legacy storage compact for unique ids; persist the pair when a collision exists.
+    public func modelReference(_ model: ModelEntry) -> String {
+        models.filter { $0.id == model.id }.count > 1 ? model.qualifiedID : model.id
+    }
+}
+
+public enum ModelIdentity {
+    public static func qualified(harness: String, id: String) -> String { "\(harness)/\(id)" }
+
+    /// Split only the first slash, and only when it names a configured harness.
+    public static func parse(_ value: String, knownHarnesses: Set<String>) -> (harness: String, id: String)? {
+        guard let slash = value.firstIndex(of: "/") else { return nil }
+        let harness = String(value[..<slash])
+        guard knownHarnesses.contains(harness) else { return nil }
+        return (harness, String(value[value.index(after: slash)...]))
+    }
 }
 
 // MARK: usage
@@ -161,7 +239,13 @@ public struct UsageReading: Codable, Equatable, Sendable {
 
 // MARK: sessions and relay
 
-public enum SessionStatus: String, Codable, Sendable { case working, idle, ended }
+public enum SessionStatus: String, Codable, Sendable { case working, idle, ended, waiting }
+
+/// What a main session is doing, as shown in status, the app and the monitor.
+public enum SessionState: String, Codable, Sendable {
+    /// No task. `running`: a turn is in progress. `waiting`: blocked on a tool permission or question. `exhausted`: its harness is out of quota (or its handoff is blocked).
+    case idle, running, waiting, exhausted, ended
+}
 
 public struct MainSession: Codable, Equatable, Identifiable, Sendable {
     public var id: String { "\(harness)-\(sessionId)" }
@@ -176,6 +260,16 @@ public struct MainSession: Codable, Equatable, Identifiable, Sendable {
     public var status: SessionStatus
     public var handedOff = false
     public var warned: Date?
+    /// Set when a handoff from this session failed; wrap_up is not resent until it clears.
+    public var handoffBlocked: String?
+    public var blockedAt: Date?
+    /// Last user prompt (redacted, truncated) and the automatic handoff file written for this session, if any.
+    public var lastPrompt: String?
+    public var autoHandoffFile: String?
+    /// Last state logged to the activity feed, so transitions are logged once.
+    public var lastState: SessionState?
+    /// Set when a handoff launched this session for one model and it reports another.
+    public var modelMismatch: String?
     public init(harness: String, sessionId: String, model: String? = nil, cwd: String, pid: Int32? = nil, started: Date,
                 lastSeen: Date, lastEvent: String, status: SessionStatus) {
         self.harness = harness; self.sessionId = sessionId; self.model = model; self.cwd = cwd; self.pid = pid
@@ -210,6 +304,11 @@ public struct HandoffRecord: Codable, Equatable, Identifiable, Sendable {
     public var launched: Bool
     public var automatic: Bool
     public var created: Date
+    /// An already-running session that received the handoff (no new terminal was launched for it).
+    public var toSession: String?
+    /// The session that started for this launched handoff, and the model it reported.
+    public var successorSession: String?
+    public var successorModel: String?
     public init(id: String, fromHarness: String, fromSession: String?, toModel: String, project: String, file: String,
                 script: String, launched: Bool, automatic: Bool, created: Date) {
         self.id = id; self.fromHarness = fromHarness; self.fromSession = fromSession; self.toModel = toModel; self.project = project
@@ -272,8 +371,10 @@ public struct Job: Codable, Equatable, Identifiable, Sendable {
     public var kind: JobKind
     public var privacy: Privacy
     public var isolation: Isolation
-    /// The main model that delegated this job (model id), used for the same-harness rule.
+    /// The main model that delegated this job (qualified when needed), used for the same-harness rule.
     public var mainModel: String?
+    /// Optional explicitly selected worker model (qualified id when ambiguous).
+    public var requestedWorker: String?
     /// Harness-qualified session id of the main session that delegated this job.
     public var parentSession: String?
     public var harness: String?
@@ -293,16 +394,27 @@ public struct Job: Codable, Equatable, Identifiable, Sendable {
     public var offload: Bool?
     /// Trusted tier-3 model that masks and decodes a masked-pipeline job (set when the job is scheduled).
     public var broker: String?
+    /// Tool calls the worker reported as denied (Claude `permission_denials`, sandbox write errors).
+    public var permissionDenials: [String]?
+    /// Receipt facts: the worker is on the ZDR allowlist; the job ran through the masked pipeline and which placeholder classes it masked.
+    public var zdr: Bool?
+    public var masked: Bool?
+    public var maskedClasses: [String]?
+    /// Fan-out: the split group this slice belongs to and its position ("2/3").
+    public var splitOf: String?
+    public var slice: String?
     /// Snapshot and git head from the first attempt, retained across quota requeues.
     public var baseline: [String: String]?
     public var baseHead: String?
+    /// Free workers whose masked attempt failed; the next masked attempt picks another provider, then a trusted worker.
+    public var maskedTried: [String]?
 
     public init(id: String = UUID().uuidString.lowercased(), project: String, objective: String, allowedFiles: [String],
                 checkArgv: [String], size: JobSize, kind: JobKind, privacy: Privacy, isolation: Isolation = .checkout,
-                mainModel: String? = nil, created: Date) {
+                mainModel: String? = nil, requestedWorker: String? = nil, created: Date) {
         self.id = id; self.project = project; self.objective = objective; self.allowedFiles = allowedFiles
         self.checkArgv = checkArgv; self.size = size; self.kind = kind; self.privacy = privacy; self.isolation = isolation
-        self.mainModel = mainModel; self.state = .queued; self.created = created
+        self.mainModel = mainModel; self.requestedWorker = requestedWorker; self.state = .queued; self.created = created
     }
 }
 
@@ -319,5 +431,16 @@ public enum JSONCoding {
         let d = JSONDecoder()
         d.dateDecodingStrategy = .iso8601
         return d
+    }
+}
+
+extension Harness {
+    /// agy rejects models that have an effort setting (its Claude models) unless --effort is passed.
+    public func withEffort(_ template: [String], _ model: ModelEntry) -> [String] {
+        guard id == "antigravity", let effort = model.effort, !template.contains("--effort"),
+              let i = template.firstIndex(of: "{model}") else { return template }
+        var t = template
+        t.insert(contentsOf: ["--effort", effort], at: i + 1)
+        return t
     }
 }

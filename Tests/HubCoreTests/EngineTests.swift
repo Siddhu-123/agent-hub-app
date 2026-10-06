@@ -142,4 +142,50 @@ struct EngineTests {
             #expect(names.count == startFiles.count, "Start file names should be unique; got duplicates in \(startFiles)")
         }
     }
+
+    @Test
+    func testTickReloadsExternalConfigBeforeSchedulingQueuedProjectJob() throws {
+        let paths = createTempPaths()
+        let project = createTempProject()
+        let antigravity = Harness(id: "antigravity", name: "Antigravity", executable: "agy", accounts: [], trusted: true,
+                                  usageSource: .none, hookStyle: .none, mainArgs: [], workerArgs: ["{prompt}"])
+        let codex = Harness(id: "codex", name: "Codex", executable: "codex", accounts: [], trusted: true,
+                            usageSource: .none, hookStyle: .none, mainArgs: [], workerArgs: ["{prompt}"])
+        let agyWorker = ModelEntry(id: "agy-worker", harness: "antigravity", name: "Agy", intelligence: 50, isMain: false, isWorker: true)
+        let codexWorker = ModelEntry(id: "codex-worker", harness: "codex", name: "Codex", intelligence: 80, isMain: false, isWorker: true)
+        let initialConfig = AppConfig(harnesses: [antigravity, codex], models: [agyWorker, codexWorker], mainOrder: [])
+        try ConfigStore.save(initialConfig, paths)
+
+        let exec: Runner.Exec = { argv, _, _, _, _, _, _ in
+            CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "done")
+        }
+        let engine = Engine(paths: paths, ctlPath: "/bin/ctl", exec: exec)
+        let queued = Job(project: project, objective: "queued", allowedFiles: ["file.txt"], checkArgv: ["true"],
+                         size: .tiny, kind: .implement, privacy: .project, created: Date())
+        let stored = try JobStore(paths: paths).enqueue(queued)
+
+        // Simulate a config.json edit made by another process after Engine initialization.
+        let updatedConfig = AppConfig(harnesses: [codex], models: [codexWorker], mainOrder: [])
+        try ConfigStore.save(updatedConfig, paths)
+        engine.tick()
+
+        #expect(engine.config == ConfigStore.load(paths).config)
+        #expect(engine.jobs.first(where: { $0.id == stored.id })?.model == "codex/codex-worker")
+    }
+
+    @Test
+    func testTickKeepsLastKnownGoodConfigWhenDiskConfigIsInvalid() throws {
+        let paths = createTempPaths()
+        var lastKnownGood = ConfigStore.defaults()
+        lastKnownGood.models.removeAll { $0.harness == "antigravity" }
+        lastKnownGood.harnesses.removeAll { $0.id == "antigravity" }
+        try ConfigStore.save(lastKnownGood, paths)
+        let engine = Engine(paths: paths, ctlPath: "/bin/ctl")
+
+        try Data("{".utf8).write(to: paths.config)
+        engine.tick(schedule: false)
+
+        #expect(engine.config == lastKnownGood)
+        #expect(engine.configWarning != nil)
+    }
 }

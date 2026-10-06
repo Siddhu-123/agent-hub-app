@@ -11,6 +11,8 @@ func jsonObject<T: Encodable>(_ value: T) throws -> Any {
     try JSONSerialization.jsonObject(with: JSONCoding.encoder.encode(value))
 }
 
+func receipt(_ j: Job, config: AppConfig) throws -> [String: Any] { try Receipt.of(j, config: config) }
+
 func agentPID() -> Int32? {
     var pid = getppid()
     let shells: Set<String> = ["sh", "zsh", "bash", "dash", "fish", "env", "login"]
@@ -89,15 +91,24 @@ func monitor(paths: HubPaths, follow: Bool, json: Bool) {
     }
 }
 
+/// The calling main session, when it is not the handoff source (a receiving session ran the command).
+func receiverFromEnv(source: String?) -> String? {
+    guard let source else { return nil }
+    let env = ProcessInfo.processInfo.environment
+    if let sid = env["CLAUDE_CODE_SESSION_ID"], sid != source { return "claude:\(sid)" }
+    if let sid = env["CODEX_THREAD_ID"], sid != source { return "codex:\(sid)" }
+    return nil
+}
+
 func run() throws -> Int32 {
     let a = try CLIArgs(Array(CommandLine.arguments.dropFirst()))
     let allowed: [String: Set<String>] = [
         "help": [], "hook": [], "statusline": [], "status": ["json"],
         "monitor": ["follow", "json"], "stats": ["json"],
-        "delegate": ["main", "size", "kind", "privacy", "project", "objective", "allowed-file", "check", "worktree", "wait", "dry-run", "offload"],
+        "delegate": ["main", "size", "kind", "privacy", "project", "objective", "allowed-file", "check", "worktree", "wait", "dry-run", "offload", "worker", "split", "fanout"],
         "send": ["harness", "session", "message", "kind"],
-        "handoff": ["from", "project", "file", "session", "to", "no-launch"],
-        "sessions": ["all"], "tick": [], "install-hooks": ["statusline", "force"], "uninstall-hooks": []
+        "handoff": ["from", "project", "file", "session", "to", "no-launch", "receiver"],
+        "cancel": ["job"], "sessions": ["all"], "models": ["zdr", "json"], "tick": [], "install-hooks": ["statusline", "force"], "uninstall-hooks": []
     ]
     guard let permitted = allowed[a.subcommand] else { throw CLIArgs.invalid("Unknown command: \(a.subcommand)") }
     for key in Set(a.flags.keys).union(a.booleans).subtracting(permitted).sorted() {
@@ -127,12 +138,14 @@ func run() throws -> Int32 {
     let now = Date()
     func snapshot() -> Snapshot {
         Snapshot(config: config, usage: UsageMeter(paths: paths).read(config, now: now),
-                 sessions: relay.sessions(now: now), jobs: store.active(), now: now)
+                 sessions: relay.sessions(now: now), jobs: store.active(), now: now,
+                 cooldowns: Cooldowns.active(paths: paths, now: now))
     }
     func sessionTable(_ sessions: [MainSession]) {
-        print("harness\tsession\tmodel\tstatus\tlast seen\tcwd")
+        let snap = snapshot()
+        print("harness\tsession\tmodel\tstate\tlast seen\tcwd")
         for s in sessions.sorted(by: { $0.id < $1.id }) {
-            print("\(s.harness)\t\(s.sessionId)\t\(s.model ?? "—")\t\(s.status.rawValue)\t\(ISO8601DateFormatter().string(from: s.lastSeen))\t\(s.cwd)")
+            print("\(s.harness)\t\(s.sessionId)\t\(s.model ?? "—")\(s.modelMismatch.map { " (\($0))" } ?? "")\t\(PolicyEngine.state(snap, s).rawValue)\t\(ISO8601DateFormatter().string(from: s.lastSeen))\t\(s.cwd)")
         }
     }
     switch a.subcommand {
@@ -184,7 +197,12 @@ func run() throws -> Int32 {
                 reading["band"] = String(describing: PolicyEngine.band(s, h.id))
                 usage[h.id] = reading
             }
-            try printJSON(["usage": usage, "sessions": try jsonObject(s.sessions), "jobs": try jsonObject(s.jobs), "explain": explain])
+            let sessions = try s.sessions.map { session -> Any in
+                var o = try jsonObject(session) as! [String: Any]
+                o["state"] = PolicyEngine.state(s, session).rawValue
+                return o
+            }
+            try printJSON(["usage": usage, "sessions": sessions, "jobs": try jsonObject(s.jobs), "explain": explain])
         } else {
             for h in config.harnesses {
                 let r = s.usage[h.id]
@@ -198,25 +216,23 @@ func run() throws -> Int32 {
         }
     case "delegate":
         let job = try CLIArgs.jobFromDelegateArgs(a, now: now)
-        if a.has("dry-run") {
+        if a.has("dry-run") && a.value("split") == nil && !a.has("fanout") {
             if let plan = PolicyEngine.plan(snapshot(), job) {
                 if let broker = plan.broker {
                     print("\(plan.worker.id) \(plan.worker.harness) (broker: \(broker.id))")
                 } else {
                     print("\(plan.worker.id) \(plan.worker.harness)")
                 }
-            } else { print("none: no eligible worker has capacity for this job") }
+            } else { print("none: \(PolicyEngine.whyQueued(snapshot(), job).reason)") }
             return 0
         }
-        let queued = try store.enqueue(job, now: now)
-        Activity.queued(queued, paths: paths)
-        if a.has("wait") || !appIsRunning(paths, now: now) {
+        /// Runs a queued job now; a skipped masked offload comes back queued with offload off and runs once more on a trusted worker.
+        func runNow(_ queued: Job) -> Job {
             var final = queued
-            // A masked offload that is skipped comes back queued with offload off; run it once more on a trusted worker.
             for _ in 0..<2 {
                 guard let plan = PolicyEngine.plan(snapshot(), final) else { break }
                 var q = final
-                q.broker = plan.broker?.id
+                q.broker = plan.broker?.qualifiedID
                 final = Runner(paths: paths, config: config).start(q, worker: plan.worker, now: Date())
                 if final.state == .running {
                     // Another process (such as the app) started the job; wait for it to become terminal (or requeued).
@@ -230,15 +246,79 @@ func run() throws -> Int32 {
                 }
                 if final.state != .queued { break }
             }
-            if final.state == .queued { try printJSON(jsonObject(final)); return 3 }
-            try printJSON(jsonObject(final))
-            switch final.state {
-            case .verified: return 0
-            case .queued, .running: return 3
-            default: return 1
-            }
+            return final
         }
-        try printJSON(["id": queued.id, "state": "queued"])
+        func finalReceipt(_ final: Job, waited: Bool) throws -> [String: Any] {
+            var final = final
+            var resetsAt: Date?
+            if final.state == .queued {
+                if waited {
+                    let why = PolicyEngine.whyQueued(snapshot(), final)
+                    final.note = why.reason
+                    resetsAt = why.resetsAt
+                } else {
+                    final.note = final.note ?? "queued; the app runs it (agenthubctl jobs show \(final.id))"
+                }
+            }
+            var r = try receipt(final, config: config)
+            if let reset = resetsAt { r["resetsAt"] = ISO8601DateFormatter().string(from: reset) }
+            if final.splitOf != nil { r["provider"] = final.model.flatMap { config.model($0)?.providerKey } ?? final.requestedWorker.flatMap { config.model($0)?.providerKey } ?? NSNull() }
+            return r
+        }
+        func exitCode(_ states: [JobState]) -> Int32 {
+            if states.allSatisfy({ $0 == .verified }) { return 0 }
+            if states.contains(where: { $0 != .verified && $0 != .queued && $0 != .running }) { return 1 }
+            return 3
+        }
+        let runInline = a.has("wait") || !appIsRunning(paths, now: now)
+
+        if a.value("split") != nil || a.has("fanout") {
+            var n: Int?
+            if let v = a.value("split") {
+                guard let parsed = Int(v), parsed >= 2 else { throw CLIArgs.invalid("--split needs a whole number of at least 2") }
+                n = parsed
+            }
+            let group = "split-" + JobStore.newId(now: now)
+            let slices = try Fanout.split(snapshot(), job, n: n, group: group)
+            if a.has("dry-run") {
+                for sl in slices { print("\(sl.slice!) \(sl.requestedWorker!) [\(config.model(sl.requestedWorker!)?.providerKey ?? "?")] \(sl.allowedFiles.joined(separator: " "))") }
+                return 0
+            }
+            var finals: [Job] = []
+            for sl in slices {
+                let q = try store.enqueue(sl, now: now)
+                Activity.queued(q, paths: paths)
+                Activity.log("job.slice", job: q.id, model: sl.requestedWorker, ["group": group, "slice": sl.slice ?? ""], paths: paths)
+                finals.append(q)
+            }
+            if runInline { finals = finals.map(runNow) }
+            var combined: [String: Any]? = nil
+            if runInline, !finals.allSatisfy({ $0.state == .verified }), let c = Fanout.combine(finals, project: job.project, check: job.checkArgv) {
+                combined = ["passed": c.passed, "applied": c.applied, "output": c.output]
+                Activity.log("job.combined", job: group, ["result": c.passed ? "pass" : "fail"], paths: paths)
+                if c.passed {
+                    finals = try finals.map { var f = $0; f.state = .verified; f.note = "combined check passed with the other slices"; try store.save(f); return f }
+                }
+            }
+            let receipts = try finals.map { try finalReceipt($0, waited: runInline) }
+            let states = finals.map(\.state)
+            let code = exitCode(states)
+            let providers = Set(finals.compactMap { ($0.model ?? $0.requestedWorker).flatMap { config.model($0)?.providerKey } })
+            try printJSON(["group": group, "split": finals.count,
+                           "state": code == 0 ? "verified" : (code == 3 ? "queued" : "failed"),
+                           "providers": providers.sorted(), "distinctProviders": providers.count == finals.count,
+                           "masked": finals.allSatisfy { $0.masked == true },
+                           "note": code == 0 ? "all slices verified" : finals.filter { $0.state != .verified }.map { "\($0.slice ?? $0.id): \($0.state.rawValue) \($0.note ?? "")" }.joined(separator: "; "),
+                           "combined": combined ?? NSNull(),
+                           "slices": receipts])
+            return code
+        }
+
+        let queued = try store.enqueue(job, now: now)
+        Activity.queued(queued, paths: paths)
+        let final = runInline ? runNow(queued) : queued
+        try printJSON(finalReceipt(final, waited: runInline))
+        return runInline ? exitCode([final.state]) : 0
     case "send":
         guard let kind = MessageKind(rawValue: a.value("kind") ?? "message") else { throw CLIArgs.invalid("Invalid --kind") }
         let message = try relay.send(a.required("harness"), a.required("session"), a.required("message"), kind: kind, now: now)
@@ -246,8 +326,32 @@ func run() throws -> Int32 {
     case "handoff":
         let record = try relay.handoff(from: a.required("from"), session: a.value("session"),
                                       project: URL(fileURLWithPath: a.required("project")).standardizedFileURL.path,
-                                      file: a.required("file"), to: a.value("to"), launch: !a.has("no-launch"), automatic: false, now: now)
+                                      file: a.required("file"), to: a.value("to"), launch: !a.has("no-launch"), automatic: false,
+                                      receiver: a.value("receiver") ?? receiverFromEnv(source: a.value("session")), now: now)
         try printJSON(jsonObject(record))
+    case "models":
+        let models = a.has("zdr") ? config.models.filter { $0.zdr == true } : config.models
+        if a.has("json") {
+            try printJSON(["zdrProjectWorkers": config.zdrProjectWorkers == true,
+                           "models": try models.map { m -> Any in
+                               var o = try jsonObject(m) as! [String: Any]
+                               o["qualifiedID"] = m.qualifiedID; o["isZDR"] = m.isZDR
+                               return o
+                           }])
+        } else {
+            print("model\tenabled\tworker\tfree\tzdr\tzdr source\tzdr date")
+            for m in models {
+                let zdr = m.isZDR ? "yes" : (m.zdr == true ? "incomplete" : "no")
+                print("\(m.qualifiedID)\t\(m.enabled)\t\(m.isWorker)\t\(m.free)\t\(zdr)\t\(m.zdrSource ?? "—")\t\(m.zdrDate ?? "—")")
+            }
+            if a.has("zdr") {
+                print("project jobs on ZDR workers: \(config.zdrProjectWorkers == true ? "allowed" : "off") (only the user changes this, in Agent Hub Settings)")
+            }
+        }
+    case "cancel":
+        let job = try store.cancel(a.required("job"))
+        Activity.log("job.cancelled", job: job.id, paths: paths, now: now)
+        try printJSON(try Receipt.of(job, config: config))
     case "sessions": sessionTable(relay.sessions(activeOnly: !a.has("all"), now: now))
     case "tick":
         MainActor.assumeIsolated {

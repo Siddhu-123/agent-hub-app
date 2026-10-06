@@ -11,7 +11,7 @@ public enum ConfigStore {
                 trusted: true,
                 usageSource: .claudeStatusline,
                 hookStyle: .claude,
-                mainArgs: ["{exe}", "--model", "{model}", "{prompt}"],
+                mainArgs: ["{exe}", "--model", "{model}", "--permission-mode", "acceptEdits", "{prompt}"],
                 workerArgs: ["{exe}", "-p", "--model", "{model}", "--permission-mode", "acceptEdits", "--output-format", "json", "{prompt}"]
             ),
             Harness(
@@ -88,8 +88,10 @@ public enum ConfigStore {
         }
 
         do {
-            try validate(config)
-            return (config, nil)
+            let migrated = migrate(config)
+            try validate(migrated)
+            if migrated != config { try? save(migrated, paths) }
+            return (migrated, nil)
         } catch {
             let unix = Int(Date().timeIntervalSince1970)
             let invalidURL = paths.root.appendingPathComponent("config.invalid-\(unix).json")
@@ -116,8 +118,8 @@ public enum ConfigStore {
 
         var modelIds = Set<String>()
         for m in c.models {
-            guard modelIds.insert(m.id).inserted else {
-                throw HubError.invalid("Duplicate model id: '\(m.id)'")
+            guard modelIds.insert(m.qualifiedID).inserted else {
+                throw HubError.invalid("Duplicate model id: '\(m.qualifiedID)'")
             }
         }
 
@@ -129,11 +131,24 @@ public enum ConfigStore {
 
         var seenMainOrder = Set<String>()
         for id in c.mainOrder {
-            guard seenMainOrder.insert(id).inserted else {
-                throw HubError.invalid("Duplicate id in mainOrder: '\(id)'")
+            let matches: [ModelEntry]
+            if let (harness, rawID) = ModelIdentity.parse(id, knownHarnesses: Set(c.harnesses.map(\.id))) {
+                let qualifiedMatches = c.models.filter { $0.harness == harness && $0.id == rawID }
+                if !qualifiedMatches.isEmpty {
+                    matches = qualifiedMatches
+                } else {
+                    let rawMatches = c.models.filter { $0.id == id }
+                    matches = rawMatches.count > 1 ? rawMatches.filter(\.isMain) : rawMatches
+                }
+            } else {
+                let all = c.models.filter { $0.id == id }
+                matches = all.count > 1 ? all.filter(\.isMain) : all
             }
-            guard let m = c.model(id) else {
+            guard matches.count == 1, let m = matches.first else {
                 throw HubError.invalid("mainOrder model '\(id)' is missing")
+            }
+            guard seenMainOrder.insert(m.qualifiedID).inserted else {
+                throw HubError.invalid("Duplicate id in mainOrder: '\(id)'")
             }
             guard m.isMain else {
                 throw HubError.invalid("mainOrder model '\(id)' is not a main model")
@@ -177,18 +192,52 @@ public enum ConfigStore {
     public static func addMainModel(_ c: inout AppConfig, model: ModelEntry) {
         var entry = model
         entry.isMain = true
-        if let idx = c.models.firstIndex(where: { $0.id == entry.id }) {
+        let oldMatches = c.models.filter { $0.id == entry.id }
+        if let idx = c.models.firstIndex(where: { $0.harness == entry.harness && $0.id == entry.id }) {
             c.models[idx] = entry
         } else {
             c.models.append(entry)
         }
-        c.mainOrder.removeAll { $0 == entry.id }
-        c.mainOrder.append(entry.id)
+        c.mainOrder.removeAll { $0 == entry.qualifiedID || ($0 == entry.id && (oldMatches.count <= 1 || oldMatches.first?.harness == entry.harness)) }
+        c.mainOrder.append(c.models.filter { $0.id == entry.id }.count > 1 ? entry.qualifiedID : entry.id)
     }
 
-    public static func removeModel(id: String, from c: inout AppConfig) {
-        c.models.removeAll { $0.id == id }
-        c.mainOrder.removeAll { $0 == id }
+    public static func upsertModel(_ entry: ModelEntry, in c: inout AppConfig) {
+        if let index = c.models.firstIndex(where: { $0.harness == entry.harness && $0.id == entry.id }) {
+            c.models[index] = entry
+        } else {
+            c.models.append(entry)
+        }
+    }
+
+    public static func removeModel(id: String, harness: String? = nil, from c: inout AppConfig) {
+        let matches = c.models.filter { $0.id == id || $0.qualifiedID == id }
+        let target = harness.flatMap { h in matches.first { $0.harness == h } } ?? (matches.count == 1 ? matches.first : nil)
+        guard let target else { return }
+        c.models.removeAll { $0.qualifiedID == target.qualifiedID }
+        let remaining = c.models.filter { $0.id == target.id }
+        c.mainOrder.removeAll { $0 == target.qualifiedID || ($0 == target.id && remaining.isEmpty) }
+    }
+
+    private static func migrate(_ input: AppConfig) -> AppConfig {
+        var config = input
+        let defaults = defaults()
+        if !config.harnesses.contains(where: { $0.id == "claude" }),
+           let defaultHarness = defaults.harness("claude") { config.harnesses.append(defaultHarness) }
+        if !config.models.contains(where: { $0.harness == "claude" && $0.id == "claude-opus-5-5" }),
+           let defaultMain = defaults.models.first(where: { $0.harness == "claude" && $0.id == "claude-opus-5-5" }) {
+            config.mainOrder.removeAll { $0 == defaultMain.id }
+            config.models.append(defaultMain)
+            config.mainOrder.insert(defaultMain.qualifiedID, at: 0)
+        }
+        config.mainOrder = config.mainOrder.map { value in
+            if ModelIdentity.parse(value, knownHarnesses: Set(config.harnesses.map(\.id))) != nil { return value }
+            let matches = config.models.filter { $0.id == value }
+            guard matches.count > 1 else { return value }
+            let mainMatches = matches.filter(\.isMain)
+            return mainMatches.count == 1 ? mainMatches[0].qualifiedID : value
+        }
+        return config
     }
 }
 
@@ -197,7 +246,7 @@ extension AppConfig {
         guard let model = model, !model.isEmpty else {
             return models.contains { $0.harness == harness && $0.enabled && $0.isMain }
         }
-        guard let entry = self.model(model) else { return false }
+        guard let entry = self.model(model, harness: harness) else { return false }
         return entry.harness == harness && entry.enabled && entry.isMain
     }
 }

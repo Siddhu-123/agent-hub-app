@@ -229,7 +229,8 @@ public struct LiveFeed: Sendable {
             }
             for (k, v) in fields where !(v is NSNull) && (v as? String != "") { s[k] = v }
             if !effectiveCwd.isEmpty && (s["cwd"] == nil || s["cwd"] as? String == "") { s["cwd"] = effectiveCwd; s["project"] = project }
-            if let em = effectiveModel, !em.isEmpty && (s["model"] == nil || s["model"] as? String == "") { s["model"] = em }
+            if p == "codex", let payloadModel, !payloadModel.isEmpty { s["model"] = payloadModel }
+            else if let em = effectiveModel, !em.isEmpty && (s["model"] == nil || s["model"] as? String == "") { s["model"] = em }
             if p == "claude" || p == "codex", let activity = fields["activity"] as? String {
                 var recent = (s["recent"] as? [[String: Any]] ?? []).compactMap { line -> LiveLine? in
                     guard let t = line["t"] as? Double, let text = line["text"] as? String else { return nil }

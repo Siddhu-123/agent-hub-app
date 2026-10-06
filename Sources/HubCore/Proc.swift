@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(Darwin)
+import Darwin
+#endif
 
 /// Process helpers shared by every module. Owned by the orchestrator: workers must not edit this file.
 public enum Proc {
@@ -24,6 +27,13 @@ public enum Proc {
         p.standardOutput = out
         p.standardError = out
         let input = Pipe()
+        #if canImport(Darwin)
+        // A worker may exit or close stdin before consuming its prompt.
+        // Return EPIPE from writes instead of terminating the Hub with SIGPIPE.
+        if stdin != nil, fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) == -1 {
+            return CheckResult(argv: argv, exitCode: 127, timedOut: false, output: "failed to configure stdin pipe")
+        }
+        #endif
         p.standardInput = stdin == nil ? FileHandle.nullDevice : input
         let buffer = OutputBuffer(keep: keep)
         out.fileHandleForReading.readabilityHandler = { h in
@@ -38,10 +48,13 @@ public enum Proc {
         }
         onStart?(p.processIdentifier)
         if let stdin {
-            DispatchQueue.global().async {
+            // A dedicated thread: the GCD global pool starves when many jobs block in this wait loop,
+            // and a child reading its prompt from stdin would then hang until the timeout.
+            let writer = Thread {
                 try? input.fileHandleForWriting.write(contentsOf: Data(stdin.utf8))
                 try? input.fileHandleForWriting.close()
             }
+            writer.start()
         }
         let deadline = Date().addingTimeInterval(timeout)
         var timedOut = false

@@ -2,6 +2,17 @@ import Foundation
 import Testing
 @testable import HubCore
 
+@Test func closedWorkerStdinDoesNotTerminateParent() {
+    let result = Proc.run(["sh", "-c", "exec 0<&-; exit 7"],
+                          stdin: String(repeating: "prompt", count: 200_000),
+                          timeout: 5,
+                          onStart: { _ in Thread.sleep(forTimeInterval: 0.1) })
+    // Let the asynchronous writer observe the closed pipe before this test exits.
+    Thread.sleep(forTimeInterval: 0.1)
+    #expect(result.exitCode == 7)
+    #expect(!result.timedOut)
+}
+
 @Test func fillBasicSubstitution() {
     #expect(Proc.fill(["--model", "{model}"], ["model": "m1"]) == ["--model", "m1"])
 }

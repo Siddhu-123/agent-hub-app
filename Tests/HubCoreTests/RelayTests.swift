@@ -49,7 +49,7 @@ final class Box<T: Sendable>: @unchecked Sendable {
         _ = relay.hook("claude", event: "SessionStart", payload: ["session_id": "sid1"], env: [:], now: now)
         
         let s1 = relay.sessions(activeOnly: false, now: now)
-        #expect(s1.first?.status == .working)
+        #expect(s1.first?.status == .idle) // Phase 6 #6: no task yet = idle
         
         _ = relay.hook("claude", event: "SessionEnd", payload: ["session_id": "sid1"], env: [:], now: now)
         
@@ -155,7 +155,7 @@ final class Box<T: Sendable>: @unchecked Sendable {
         let record = try relay.handoff(from: "claude", session: "sid1", project: projectPath.path, file: handoffFile.path, to: "gpt-6.1-sol", launch: true, automatic: false, now: Date())
         
         #expect(openedScript.value != nil)
-        #expect(record.toModel == "gpt-6.1-sol")
+        #expect(record.toModel == "codex/gpt-6.1-sol")
         
         // Check session marked handedOff
         let s = relay.sessions(activeOnly: false, now: Date()).first { $0.sessionId == "sid1" }
@@ -175,6 +175,45 @@ final class Box<T: Sendable>: @unchecked Sendable {
         }
     }
     
+    @Test func repeatedHandoffReturnsEarlierRecordWithoutSecondLaunch() throws {
+        let opened = Box(0)
+        let relay = Relay(paths: paths, config: config, ctlPath: "ctl", openScript: { _ in opened.value += 1; return true })
+        let projectPath = tmpDir.appendingPathComponent("proj-repeat")
+        try FileManager.default.createDirectory(at: projectPath, withIntermediateDirectories: true)
+        let handoffFile = projectPath.appendingPathComponent("handoff.md")
+        try "handoff content".write(to: handoffFile, atomically: true, encoding: .utf8)
+        let now = Date()
+        _ = relay.hook("claude", event: "SessionStart", payload: ["session_id": "sid1"], env: [:], now: now)
+        let first = try relay.handoff(from: "claude", session: "sid1", project: projectPath.path, file: handoffFile.path, to: "gpt-6.1-sol", launch: true, automatic: false, now: now)
+        let again = try relay.handoff(from: "claude", session: "sid1", project: projectPath.path, file: "handoff.md", to: "gpt-6.1-sol", launch: true, automatic: false, now: now.addingTimeInterval(5))
+        #expect(again.id == first.id)
+        #expect(opened.value == 1)
+        let later = try relay.handoff(from: "claude", session: "sid1", project: projectPath.path, file: handoffFile.path, to: "gpt-6.1-sol", launch: true, automatic: false, now: now.addingTimeInterval(Relay.repeatHandoffWindow + 1))
+        #expect(later.id != first.id)
+    }
+
+    @Test func closeFinishedEndsOnlyHubLaunchedSessions() throws {
+        let killed = Box<[Int32]>([])
+        let relay = Relay(paths: paths, config: config, ctlPath: "ctl", openScript: { _ in true },
+                          terminate: { pid, _ in killed.value.append(pid); return true })
+        let projectPath = tmpDir.appendingPathComponent("proj-close")
+        try FileManager.default.createDirectory(at: projectPath, withIntermediateDirectories: true)
+        let handoffFile = projectPath.appendingPathComponent("handoff.md")
+        try "handoff content".write(to: handoffFile, atomically: true, encoding: .utf8)
+        let now = Date()
+        _ = relay.hook("claude", event: "SessionStart", payload: ["session_id": "user1", "cwd": projectPath.path, "agent_pid": 111], env: [:], now: now)
+        _ = try relay.handoff(from: "claude", session: "user1", project: projectPath.path, file: handoffFile.path, to: "gpt-6.1-sol", launch: true, automatic: false, now: now)
+        _ = relay.hook("codex", event: "SessionStart", payload: ["session_id": "succ1", "cwd": projectPath.path, "model": "gpt-6.1-sol", "agent_pid": 222], env: [:], now: now.addingTimeInterval(1))
+        _ = relay.hook("codex", event: "Stop", payload: ["session_id": "succ1"], env: [:], now: now.addingTimeInterval(2))
+        #expect(relay.closeFinished(now: now.addingTimeInterval(300)).isEmpty)
+        let lines = relay.closeFinished(now: now.addingTimeInterval(2 + config.limits.closeIdleLaunchedSeconds + 1))
+        #expect(lines.count == 1)
+        #expect(killed.value == [222])
+        #expect(relay.sessions(activeOnly: false, now: now).first { $0.sessionId == "succ1" }?.status == .ended)
+        // Already ended: not closed twice.
+        #expect(relay.closeFinished(now: now.addingTimeInterval(9000)).isEmpty)
+    }
+
     @Test func handoffNoCapacityThrows() {
         let usage: [String: UsageReading] = ["codex": UsageReading(left: 0.0, source: "codexSessions"),
                                              "claude": UsageReading(left: 0.0, source: "claudeStatusline")]
@@ -494,7 +533,7 @@ final class Box<T: Sendable>: @unchecked Sendable {
 
         // Handoff from sid1: since maxMainSessions == 1, sid1 leaving frees the slot! Handoff succeeds!
         let record = try relay.handoff(from: "claude", session: "sid1", project: projectPath.path, file: handoffFile.path, to: "gpt-6.1-sol", launch: true, automatic: false, now: now.addingTimeInterval(1))
-        #expect(record.toModel == "gpt-6.1-sol")
+        #expect(record.toModel == "codex/gpt-6.1-sol")
         #expect(openedScript.value != nil)
 
         // Now register 2 active sessions (sid_a and sid_b) with maxMainSessions = 1

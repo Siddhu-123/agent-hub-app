@@ -61,6 +61,45 @@ struct TreeTests {
         #expect(shrunk.chats[id]?.count == 1)
     }
 
+    @Test func codexLiveModelRefreshesTheExistingSessionNode() throws {
+        let paths = paths()
+        defer { try? FileManager.default.removeItem(at: paths.root) }
+        try FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
+        var codex = session("model-switch")
+        codex.platform = "codex"
+        codex.platformName = "Codex"
+        codex.model = "gpt-old"
+        try save(codex, paths: paths)
+
+        let first = read(paths)
+        let id = "s:codex:model-switch"
+        #expect(first.sessions[id]?.model == "gpt-old")
+        #expect(first.roots.first?.title == "gpt-old")
+
+        codex.model = "gpt-new"
+        try save(codex, paths: paths)
+        let refreshed = read(paths, after: first, at: now.addingTimeInterval(1))
+        #expect(refreshed.sessions[id]?.model == "gpt-new")
+        #expect(refreshed.roots.first?.title == "gpt-new")
+    }
+
+    @Test func completedJobIsHiddenFromTreeButRetainedInSnapshot() throws {
+        let paths = paths()
+        defer { try? FileManager.default.removeItem(at: paths.root) }
+        try FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
+        try save(session("done"), paths: paths)
+        var finished = Job(id: "finished", project: paths.root.path, objective: "Finished work", allowedFiles: ["a"],
+                           checkArgv: ["echo", "ok"], size: .tiny, kind: .implement, privacy: .project, created: now)
+        finished.parentSession = "claude:done"
+        finished.state = .verified
+        finished.finished = now
+        try JobStore(paths: paths).save(finished)
+
+        let snapshot = read(paths)
+        #expect(snapshot.roots.first?.children.isEmpty == true)
+        #expect(snapshot.jobs[finished.id]?.state == .verified)
+    }
+
     @Test func logGrowthGoesOnlyToCurrentStage() throws {
         let paths = paths()
         defer { try? FileManager.default.removeItem(at: paths.root) }

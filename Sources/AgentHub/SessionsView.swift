@@ -10,6 +10,7 @@ struct SessionsView: View {
     @State private var sendMessageSession: MainSession?
     
     var body: some View {
+        let snap = engine.snapshot()
         VStack {
             Table(engine.sessions, selection: $selection) {
                 TableColumn("Harness", value: \.harness)
@@ -18,7 +19,7 @@ struct SessionsView: View {
                     Text(URL(fileURLWithPath: s.cwd).lastPathComponent)
                         .help(s.cwd)
                 }
-                TableColumn("Status") { s in Text(s.status.rawValue) }
+                TableColumn("State") { s in Text(PolicyEngine.state(snap, s).rawValue) }
                 TableColumn("Last Seen") { s in Text(relativeDate(s.lastSeen)) }
                 TableColumn("Warned") { s in Text(relativeDate(s.warned)) }
             }
@@ -29,9 +30,9 @@ struct SessionsView: View {
                         Button("Best available") {
                             do { try engine.handoff(session: s, to: nil) } catch { self.error = error }
                         }
-                        ForEach(engine.config.models.filter { $0.isMain && $0.enabled }) { m in
-                            Button(m.name) {
-                                do { try engine.handoff(session: s, to: m.id) } catch { self.error = error }
+                        ForEach(engine.config.models.filter { $0.isMain && $0.enabled }, id: \.qualifiedID) { m in
+                            Button("\(m.name) (\(m.qualifiedID))") {
+                                do { try engine.handoff(session: s, to: m.qualifiedID) } catch { self.error = error }
                             }
                         }
                     }
@@ -109,8 +110,8 @@ struct NewSessionSheet: View {
     var body: some View {
         Form {
             Picker("Main Model", selection: $modelId) {
-                ForEach(engine.config.models.filter { $0.isMain }) { m in
-                    Text(m.name).tag(m.id)
+                ForEach(engine.config.models.filter { $0.isMain }, id: \.qualifiedID) { m in
+                    Text("\(m.name) (\(m.qualifiedID))").tag(m.qualifiedID)
                 }
             }
             
@@ -151,7 +152,7 @@ struct NewSessionSheet: View {
         .frame(width: 400)
         .onAppear {
             if let first = engine.config.models.first(where: { $0.isMain }) {
-                modelId = first.id
+                modelId = first.qualifiedID
             }
         }
         .errorAlert(error: $error)

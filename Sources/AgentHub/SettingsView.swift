@@ -33,6 +33,12 @@ struct SettingsView: View {
                             Slider(value: binding.limits.wrapUpBelow, in: 0...1)
                         }
                         HStack {
+                            Text("Wrap-up at \(Int(((1 - draft.limits.wrapUpReserve) * 100).rounded()))% used")
+                                .frame(width: 150, alignment: .leading)
+                            Slider(value: binding.limits.wrapUpReserve, in: 0.10...0.15, step: 0.01)
+                        }
+                        .help("wrap_up is sent once this much quota is used, even if Wrap Up above is lower (85–90%).")
+                        HStack {
                             Text("Single: \(Int(draft.limits.singleSessionBelow * 100))%")
                                 .frame(width: 150, alignment: .leading)
                             Slider(value: binding.limits.singleSessionBelow, in: 0...1)
@@ -50,7 +56,7 @@ struct SettingsView: View {
                                 Rectangle().fill(Band.healthy.color)
                                 Rectangle().fill(Band.reduced.color).frame(width: w * draft.limits.sameHarnessMinLeft)
                                 Rectangle().fill(Band.single.color).frame(width: w * draft.limits.singleSessionBelow)
-                                Rectangle().fill(Band.wrapUp.color).frame(width: w * draft.limits.wrapUpBelow)
+                                Rectangle().fill(Band.wrapUp.color).frame(width: w * max(draft.limits.wrapUpBelow, draft.limits.wrapUpReserve))
                                 Rectangle().fill(Band.exhausted.color).frame(width: w * draft.limits.exhaustedAtOrBelow)
                             }
                         }
@@ -77,6 +83,10 @@ struct SettingsView: View {
                 
                 Section("General") {
                     Toggle("Auto Launch", isOn: binding.autoLaunch)
+                    Toggle("Let ZDR-listed workers run project jobs", isOn: Binding(
+                        get: { binding.wrappedValue.zdrProjectWorkers ?? false },
+                        set: { binding.wrappedValue.zdrProjectWorkers = $0 }))
+                        .help("Only models marked zdr with a source and date (agenthubctl models --zdr). Agents cannot change this.")
                     TextField("Terminal App", text: binding.terminalApp)
                     Toggle("Launch Notch with Agent Hub", isOn: $launchNotch)
                 }

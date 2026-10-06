@@ -129,13 +129,15 @@ struct LiveFeedTests {
         feed.writeHeartbeat(jobs: [], usage: [:], bands: [:], hooks: [:])
         try JSONSerialization.data(withJSONObject: ["alive_at": Date().timeIntervalSince1970 + 60, "hold_permissions": true, "hold_seconds": 10]).write(to: paths.live.appendingPathComponent("notch.json"))
         let group = DispatchGroup(); group.enter()
-        DispatchQueue.global().async {
+        // A dedicated thread: the GCD pool can be saturated by other suites' blocking waits.
+        Thread {
             defer { group.leave() }
-            for _ in 0..<300 {
+            let deadline = Date().addingTimeInterval(8)
+            while Date() < deadline {
                 if let request = feed.requests().first, request.canAnswer { feed.respond(requestId: request.id, decision: decision); return }
                 Thread.sleep(forTimeInterval: 0.01)
             }
-        }
+        }.start()
         let output = feed.handle(platform: "codex", event: "PermissionRequest", payload: ["tool_name": "exec_command", "tool_input": ["cmd": "ls"], "permission_suggestions": [["type": "addRules"]]], env: [:], pid: getpid())
         group.wait()
         if decision == "app" {
@@ -182,6 +184,30 @@ struct LiveFeedTests {
         #expect(LiveFeed.describeTool("update_plan", [:]) == "Updating plan")
         #expect(LiveFeed.hostApp(env: ["__CFBundleIdentifier": "org.python.python", "TERM_PROGRAM": "ghostty"], platform: "claude") == "com.mitchellh.ghostty")
         #expect(!LiveFeed.requestSummary("claude", "mcp__x__send", ["to": "team", "body": "hi", "n": ["a": 1]]).1.contains("{"))
+    }
+    @Test func codexSessionModelRefreshesFromLaterHookEvent() throws {
+        let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }
+        let paths = HubPaths(root: root), feed = LiveFeed(paths: paths), now = Date()
+
+        _ = feed.handle(platform: "codex", event: "SessionStart", payload: [
+            "session_id": "model-change",
+            "cwd": "/work/project",
+            "model": "gpt-5-codex"
+        ], env: [:], pid: getpid(), now: now)
+        #expect(feed.sessions(now: now).first?.model == "gpt-5-codex")
+
+        _ = feed.handle(platform: "codex", event: "PostToolUse", payload: [
+            "session_id": "model-change",
+            "cwd": "/work/project",
+            "model": "gpt-6.1-sol",
+            "tool_name": "Bash",
+            "tool_input": ["command": "true"]
+        ], env: [:], pid: getpid(), now: now.addingTimeInterval(1))
+
+        #expect(feed.sessions(now: now.addingTimeInterval(1)).first?.model == "gpt-6.1-sol")
+        let sessionFile = paths.live.appendingPathComponent("sessions/codex-model-change.json")
+        let persisted = try json(sessionFile)
+        #expect(persisted["model"] as? String == "gpt-6.1-sol")
     }
     @Test func heartbeatLaunchAndPruning() throws {
         let root = try temporary(); defer { try? FileManager.default.removeItem(at: root) }

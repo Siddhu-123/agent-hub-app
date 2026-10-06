@@ -16,10 +16,14 @@ public struct CLIArgs {
       delegate --main MODEL --project DIR --objective TEXT --allowed-file FILE ...
                --check '["command","arg"]' [--size tiny|routine|hard]
                [--kind implement|review|plan] [--privacy project|generic]
-               [--worktree] [--wait] [--dry-run] [--offload auto|always|never]
+               [--worktree] [--wait] [--dry-run] [--offload auto|always|never] [--worker HARNESS/MODEL]
+               [--split N | --fanout]
       send --harness HARNESS --session ID --message TEXT [--kind message|task|wrap_up]
       handoff --from HARNESS --project DIR --file FILE [--session ID] [--to MODEL] [--no-launch]
+              [--receiver HARNESS:SESSION]
+      cancel --job ID
       sessions [--all]
+      models [--zdr]
       tick
       install-hooks [--statusline] [--force]
       uninstall-hooks
@@ -28,8 +32,8 @@ public struct CLIArgs {
 
     public init(_ arguments: [String]) throws {
         subcommand = arguments.first ?? "help"
-        let values: Set<String> = ["main", "size", "kind", "privacy", "project", "objective", "allowed-file", "check", "harness", "session", "message", "from", "file", "to", "offload"]
-        let switches: Set<String> = ["json", "wait", "dry-run", "worktree", "all", "statusline", "force", "no-launch", "follow"]
+        let values: Set<String> = ["main", "size", "kind", "privacy", "project", "objective", "allowed-file", "check", "harness", "session", "message", "from", "file", "to", "offload", "worker", "receiver", "split", "job"]
+        let switches: Set<String> = ["json", "wait", "dry-run", "worktree", "all", "statusline", "force", "no-launch", "follow", "fanout", "zdr"]
         var i = 1
         while i < arguments.count {
             let token = arguments[i]
@@ -79,7 +83,7 @@ public struct CLIArgs {
         var job = Job(id: JobStore.newId(now: now), project: project, objective: try a.required("objective"),
                    allowedFiles: files, checkArgv: check, size: size, kind: kind, privacy: privacy,
                    isolation: a.has("worktree") ? .worktree : .checkout,
-                   mainModel: try a.required("main"), created: now)
+                   mainModel: try a.required("main"), requestedWorker: a.value("worker"), created: now)
         if let session = env["CLAUDE_CODE_SESSION_ID"], !session.isEmpty {
             job.parentSession = "claude:\(session)"
         } else if let thread = env["CODEX_THREAD_ID"], !thread.isEmpty {

@@ -72,6 +72,12 @@ struct CLITests {
         #expect(job.allowedFiles == ["main.swift", "other.swift"])
     }
 
+    @Test func workerFlagPinsQualifiedModel() throws {
+        let job = try CLIArgs.jobFromDelegateArgs(args(["--worker", "antigravity/claude-opus-5-5"]), now: now)
+        #expect(job.requestedWorker == "antigravity/claude-opus-5-5")
+        #expect(try CLIArgs(["delegate", "--worker", "antigravity/claude-opus-5-5"]).value("worker") == "antigravity/claude-opus-5-5")
+    }
+
     @Test func invalidCheckJSONAndEnums() throws {
         for text in ["bad json", "{}", "[1]", "[\"sh\",1]", "null", "\"sh\""] {
             #expect(throws: HubError.self) {

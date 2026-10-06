@@ -38,10 +38,29 @@ public struct JobStore: Sendable {
         return all().filter { $0.state == .queued || $0.state == .running }
     }
     
+    /// Marks a queued or running job cancelled. The runner stops it at its next stage boundary.
+    @discardableResult
+    public func cancel(_ id: String) throws -> Job {
+        guard var j = get(id) else { throw HubError.invalid("job not found: \(id)") }
+        guard j.state == .queued || j.state == .running else { throw HubError.invalid("job \(id) is already \(j.state.rawValue)") }
+        j.state = .cancelled
+        j.note = "cancelled by user"
+        try save(j)
+        return j
+    }
+
     /// Validates and stores the job with a fresh id. Returns the stored job.
     @discardableResult
     public func enqueue(_ job: Job, now: Date = Date()) throws -> Job {
         var j = job
+        if (j.mainModel != nil || j.requestedWorker != nil), FileManager.default.fileExists(atPath: paths.config.path) {
+            let config = ConfigStore.load(paths).config
+            if let main = j.mainModel {
+                let preferred = j.parentSession.flatMap { $0.split(separator: ":", maxSplits: 1).first.map(String.init) }
+                j.mainModel = try config.mainReference(main, preferredHarness: preferred)
+            }
+            if let worker = j.requestedWorker { j.requestedWorker = try config.resolveModel(worker).qualifiedID }
+        }
 
         if j.privacy == .generic {
             let o = j.objective

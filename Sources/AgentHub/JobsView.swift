@@ -9,6 +9,7 @@ struct JobsView: View {
     @State private var isNewJob = false
     
     var body: some View {
+        GeometryReader { geometry in
         HSplitView {
             VStack {
                 Table(engine.jobs, selection: $selection) {
@@ -50,7 +51,8 @@ struct JobsView: View {
                         }
                     }
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(maxWidth: .infinity)
+                .frame(height: max(0, geometry.size.height - 64))
                 
                 HStack {
                     Button("New job...") { isNewJob = true }
@@ -59,16 +61,20 @@ struct JobsView: View {
                 .padding()
             }
             .frame(minWidth: 450, maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+            .frame(height: geometry.size.height)
             
             if let sel = selection, let j = engine.jobs.first(where: { $0.id == sel }) {
                 JobDetailView(job: j)
                     .frame(minWidth: 250)
+                    .frame(height: geometry.size.height)
             } else {
                 ContentUnavailableView("Select a job", systemImage: "mouse")
                     .frame(minWidth: 250)
+                    .frame(height: geometry.size.height)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(width: geometry.size.width, height: geometry.size.height)
+        }
         .errorAlert(error: $error)
         .sheet(isPresented: $isNewJob) {
             NewJobSheet(isPresented: $isNewJob)
@@ -177,8 +183,8 @@ struct NewJobSheet: View {
             
             Picker("Delegating Main Model (optional)", selection: $mainModel) {
                 Text("None").tag("")
-                ForEach(engine.config.models.filter { $0.isMain }) { m in
-                    Text(m.name).tag(m.id)
+                ForEach(engine.config.models.filter { $0.isMain }, id: \.qualifiedID) { m in
+                    Text("\(m.name) (\(m.qualifiedID))").tag(m.qualifiedID)
                 }
             }
             

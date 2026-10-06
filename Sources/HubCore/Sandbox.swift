@@ -110,7 +110,8 @@ public enum Sandbox {
                 "*": "ask",
                 "read": p,
                 "edit": p,
-                "bash": "ask",
+                // Shell commands run inside the sandbox-exec fence, which only exposes this stage.
+                "bash": "allow",
                 "external_directory": "ask",
                 "task": "ask",
                 "skill": "ask",
@@ -147,9 +148,23 @@ public enum Sandbox {
     }
     
     /// The tool is resolved to an absolute path first, because the sandboxed process cannot search the user's PATH entries under /Users.
-    public static func wrap(_ argv: [String]) -> [String] {
-        guard let first = argv.first else { return [exe, "-p", profile] }
-        return [exe, "-p", profile, Proc.resolve(first) ?? first] + argv.dropFirst()
+    /// With `own` (a stage's work dir) the process is fenced to it: every other temp dir, including other jobs' stages, is denied.
+    public static func wrap(_ argv: [String], own: String? = nil) -> [String] {
+        let p = own.map(fenced) ?? profile
+        guard let first = argv.first else { return [exe, "-p", p] }
+        return [exe, "-p", p, Proc.resolve(first) ?? first] + argv.dropFirst()
+    }
+
+    static func fenced(_ own: String) -> String {
+        // realpath keeps the /private prefix that the profile rules use; URL.resolvingSymlinksInPath strips it.
+        let dir = (realpath(own, nil).map { p in defer { free(p) }; return String(cString: p) } ?? own).replacingOccurrences(of: "\\", with: "").replacingOccurrences(of: "\"", with: "")
+        return """
+            (version 1) (allow default)
+            (deny file-read* file-write* (subpath "/Users") (subpath "/Volumes") (subpath "/private/var/folders") (subpath "/private/tmp") (subpath "/private/var/tmp"))
+            (allow file-read* file-write* (subpath "\(dir)"))
+            (deny network-outbound (remote ip "localhost:*"))
+
+            """
     }
     
     static func scrubbed(_ env: [String: String]) -> [String: String] {

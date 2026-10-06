@@ -46,6 +46,27 @@ struct MaskedTests {
         #expect(plan?.broker == nil)
     }
 
+    @Test func offloadAlwaysMasksTinyJobs() {
+        var job = Job(project: "/tmp/p", objective: "obj", allowedFiles: [], checkArgv: [], size: .tiny, kind: .implement, privacy: .project, created: now)
+        job.offload = true
+        let plan = PolicyEngine.plan(snapshot(), job)
+        #expect(plan?.worker.id == "m2")
+        #expect(plan?.broker?.id == "m1")
+    }
+
+    @Test func offloadAlwaysFallsBackToLeastCapableTrustedBroker() {
+        var s = snapshot()
+        s.config.models[0].intelligence = 85 // nothing left in 55...79
+        var job = Job(project: "/tmp/p", objective: "obj", allowedFiles: [], checkArgv: [], size: .tiny, kind: .implement, privacy: .project, created: now)
+        job.offload = true
+        #expect(PolicyEngine.plan(s, job)?.broker?.id == "m1") // 85 < m3's 90
+        s.config.models[0].brokerEligible = false
+        #expect(PolicyEngine.plan(s, job)?.broker?.id == "m3")
+        job.offload = nil
+        job.size = .hard
+        #expect(PolicyEngine.plan(s, job)?.broker == nil) // auto mode keeps the old range-only behaviour
+    }
+
     @Test func testPlanNilBrokerWhenNoTier3Model() {
         var s = snapshot()
         s.config.models[0].intelligence = 90 // no model left in the tier-3 range
@@ -149,6 +170,9 @@ struct MaskedTests {
         let finalJob = runner.start(job, worker: s.config.model("m2")!, now: now)
         #expect(finalJob.state == (heavyExit == 0 ? .verified : .needsReview))
         #expect(finalJob.note == (heavyExit == 0 ? "masked via m1" : "worker failed (nonzero exit)"))
+        #expect(finalJob.masked == true)
+        #expect(finalJob.maskedClasses == ["identifier"])
+        #expect(finalJob.zdr == false)
         #expect(workerPrompts.value.count == 2)
         #expect(workerPrompts.value.last?.contains("not edited: ./neutral.swift") == true)
         #expect(workerPrompts.value.last?.contains("agenthub-mask") == false)
@@ -333,5 +357,68 @@ struct MaskedTests {
         let finalJob = runner.start(queuedJob, worker: s.config.model("m2")!, now: now)
         #expect(finalJob.state == .cancelled)
         #expect(maskAttempts == 2)
+    }
+}
+
+extension MaskedTests {
+    @Test func failedFreeWorkerFallsThroughToAnotherRoute() throws {
+        let s = snapshot()
+        let paths = HubPaths(root: URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("hub-\(UUID().uuidString)"))
+        try? FileManager.default.createDirectory(at: paths.root, withIntermediateDirectories: true)
+        let runner = Runner(paths: paths, config: s.config)
+        let project = paths.root.appendingPathComponent("project")
+        try FileManager.default.createDirectory(at: project, withIntermediateDirectories: true)
+        var job = Job(project: project.path, objective: "obj", allowedFiles: ["main.swift"], checkArgv: ["sh", "test.sh"], size: .hard, kind: .implement, privacy: .project, requestedWorker: "m2", created: now)
+        job.broker = "m1"
+        job.offload = true
+        try "original code".write(to: project.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+        runner.exec = { argv, cwd, env, stdin, timeout, pidCallback, onOutput in
+            let dir = cwd ?? ""
+            if argv.contains("m1") {
+                if (stdin ?? "").contains("MASK step") {
+                    let files = URL(fileURLWithPath: dir).appendingPathComponent("files")
+                    try? FileManager.default.createDirectory(at: files, withIntermediateDirectories: true)
+                    try? "masked code".write(to: files.appendingPathComponent("main.swift"), atomically: true, encoding: .utf8)
+                    try? "generic brief".write(to: URL(fileURLWithPath: dir).appendingPathComponent("brief.md"), atomically: true, encoding: .utf8)
+                    try? "{\"placeholders\":{\"P1\":\"orig\"},\"files\":{\"main.swift\":\"main.swift\"}}".write(to: URL(fileURLWithPath: dir).appendingPathComponent("map.json"), atomically: true, encoding: .utf8)
+                    try? "[\"sh\",\"check.sh\"]".write(to: URL(fileURLWithPath: dir).appendingPathComponent("check.json"), atomically: true, encoding: .utf8)
+                }
+                return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "broker ok")
+            }
+            if argv.last == "check.sh" {
+                // The masked check runs fenced in the stage, never in the mask dir.
+                #expect(!dir.contains("agenthub-mask-"))
+                #expect(argv.first == Sandbox.exe)
+                return CheckResult(argv: argv, exitCode: 1, timedOut: false, output: "check failed")
+            }
+            return CheckResult(argv: argv, exitCode: 0, timedOut: false, output: "worker ok")
+        }
+        let result = runner.start(job, worker: s.config.model("m2")!, now: now)
+        #expect(result.state == .queued)
+        #expect(result.maskedTried == [s.config.model("m2")!.qualifiedID])
+        #expect(result.requestedWorker == nil)
+        #expect(result.offload == true)
+        // The failed provider is excluded, so the next route is a trusted worker rather than a stuck queue.
+        let next = PolicyEngine.plan(s, result)
+        #expect(next?.worker.id == "m3")
+        #expect(next?.broker == nil)
+    }
+
+    @Test func fencedSandboxSeesOnlyItsOwnStage() throws {
+        guard Sandbox.available() else { return }
+        let own = URL(fileURLWithPath: "/private/tmp/agenthub-fence-\(UUID().uuidString)")
+        let other = URL(fileURLWithPath: "/private/tmp/agenthub-other-\(UUID().uuidString)")
+        let mask = URL(fileURLWithPath: "/private/tmp/agenthub-mask-fence-\(UUID().uuidString)")
+        for d in [own, other, mask] { try FileManager.default.createDirectory(at: d, withIntermediateDirectories: true) }
+        defer { for d in [own, other, mask] { try? FileManager.default.removeItem(at: d) } }
+        try "x".write(to: other.appendingPathComponent("a.txt"), atomically: true, encoding: .utf8)
+        try "x".write(to: mask.appendingPathComponent("map.json"), atomically: true, encoding: .utf8)
+        try "exit 0\n".write(to: own.appendingPathComponent("t.sh"), atomically: true, encoding: .utf8)
+
+        #expect(Proc.run(Sandbox.wrap(["/bin/sh", "t.sh"], own: own.path), cwd: own.path).passed)
+        #expect(Proc.run(Sandbox.wrap(["/bin/sh", "-c", "echo hi > out.txt"], own: own.path), cwd: own.path).passed)
+        #expect(!Proc.run(Sandbox.wrap(["/bin/cat", other.appendingPathComponent("a.txt").path], own: own.path)).passed)
+        #expect(!Proc.run(Sandbox.wrap(["/bin/cat", mask.appendingPathComponent("map.json").path], own: own.path)).passed)
+        #expect(!Proc.run(Sandbox.wrap(["/bin/ls", NSHomeDirectory()], own: own.path)).passed)
     }
 }

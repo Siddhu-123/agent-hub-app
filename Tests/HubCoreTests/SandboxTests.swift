@@ -52,7 +52,7 @@ struct SandboxTests {
         let configDict = try JSONSerialization.jsonObject(with: configData, options: []) as! [String: Any]
         let perm = configDict["permission"] as! [String: Any]
         let edit = perm["edit"] as! [String: Any]
-        #expect(perm["bash"] as? String == "ask")
+        #expect(perm["bash"] as? String == "allow")
         #expect(edit["c.swift"] as? String == "allow")
         // OpenCode's last matching rule wins, so the "*" fallback must come before every per-file allow in the raw JSON.
         for section in ["\"read\":{", "\"edit\":{"] {

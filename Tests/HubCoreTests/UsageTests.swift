@@ -3,6 +3,27 @@ import Testing
 @testable import HubCore
 
 @Suite struct UsageTests {
+    /// Regression (Notch Phase 6): a trailing `premium` record with null windows hid the
+    /// exhausted `codex` record, so Codex read as "unknown" and was treated as healthy.
+    @Test func codexPremiumNullRecordDoesNotHideExhaustedCodexLimit() throws {
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: tempDir) }
+        let sessionsDir = tempDir.appendingPathComponent("sessions")
+        try FileManager.default.createDirectory(at: sessionsDir, withIntermediateDirectories: true)
+        let now = Date()
+        let reset = Int(now.timeIntervalSince1970 + 4500)
+        let lines = [
+            #"{"type":"event_msg","payload":{"rate_limits":{"limit_id":"codex","primary":{"used_percent":100.0,"window_minutes":300,"resets_at":\#(reset)},"secondary":{"used_percent":42.0,"window_minutes":10080,"resets_at":\#(reset + 99999)}}}}"#,
+            #"{"type":"event_msg","payload":{"rate_limits":{"limit_id":"premium","primary":null,"secondary":null}}}"#,
+        ]
+        try lines.joined(separator: "\n").write(to: sessionsDir.appendingPathComponent("s.jsonl"), atomically: true, encoding: .utf8)
+
+        let reading = try #require(UsageMeter(paths: HubPaths(root: tempDir), codexSessionsDir: sessionsDir)
+            .read(ConfigStore.defaults(), now: now)["codex"])
+        #expect(reading.left == 0.0)
+        #expect(reading.windows.first { $0.name == "5h" }?.resetsAt == Date(timeIntervalSince1970: TimeInterval(reset)))
+    }
+
     @Test func codexJsonlParsing() throws {
         let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: tempDir) }

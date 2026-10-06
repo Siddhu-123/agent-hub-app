@@ -36,12 +36,14 @@ struct HubTreeTests {
         #expect(mismatch.first { $0.id == "s:claude:new" }?.children.isEmpty == true)
     }
 
-    @Test func orphansAndOldFinishedJobsAreHandled() {
+    @Test func completedJobsLeaveTheActiveTree() {
         let recent = job("orphan", state: .verified, created: now.addingTimeInterval(-60), project: "/missing")
         let old = job("old", state: .verified, created: now.addingTimeInterval(-1801), project: "/missing")
         let roots = HubTree.build(sessions: [], jobs: [old, recent], modelHarness: [:], now: now)
-        #expect(roots.map(\.id) == ["orphans"])
-        #expect(roots.first?.children.map(\.id) == ["j:orphan"])
+        #expect(roots.isEmpty)
+        let reused = job("orphan", state: .queued, project: "/missing")
+        let reusedRoots = HubTree.build(sessions: [], jobs: [recent, reused], modelHarness: [:], now: now)
+        #expect(reusedRoots.first?.children.map(\.id) == ["j:orphan"])
     }
 
     @Test func rootAndChildOrdering() {
@@ -56,11 +58,11 @@ struct HubTreeTests {
     }
 
     @Test func brokerAndCheckChildrenReflectGate() {
-        var passed = job("passed")
+        var passed = job("passed", state: .running)
         passed.parentSession = "claude:s"
         passed.broker = "broker-model"
         passed.gate = GateResult(acceptance: CheckResult(argv: ["sh", "check.sh"], exitCode: 0, timedOut: false, output: "ok"), changedFiles: ["main.swift"], outsideAllowed: [])
-        var failed = job("failed")
+        var failed = job("failed", state: .running)
         failed.parentSession = "claude:s"
         failed.gate = GateResult(acceptance: CheckResult(argv: ["sh", "check.sh"], exitCode: 1, timedOut: false, output: "no"), changedFiles: [], outsideAllowed: [])
         let root = HubTree.build(sessions: [session("s")], jobs: [passed, failed], modelHarness: [:], now: now).first
@@ -81,8 +83,8 @@ struct HubTreeTests {
         #expect(root?.children.first?.active == true)
     }
 
-    @Test func verifiedReviewJobWithNoChangesYieldsPassedCheckNode() {
-        var reviewJob = job("review-1", state: .verified)
+    @Test func runningReviewJobWithNoChangesYieldsPassedCheckNode() {
+        var reviewJob = job("review-1", state: .running)
         reviewJob.kind = .review
         reviewJob.parentSession = "claude:s"
         reviewJob.gate = GateResult(acceptance: CheckResult(argv: ["sh", "check.sh"], exitCode: 0, timedOut: false, output: "ok"), changedFiles: [], outsideAllowed: [])

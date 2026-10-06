@@ -13,79 +13,7 @@ struct ModelsView: View {
             if let draft = draft {
                 let binding = Binding(get: { draft }, set: { self.draft = $0 })
                 
-                Table(binding.models) {
-                    TableColumn("") { b in
-                        Button(role: .destructive) {
-                            modelToDelete = b.wrappedValue
-                        } label: {
-                            Image(systemName: "trash")
-                                .foregroundColor(.red)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Delete model")
-                    }
-                    .width(min: 28, ideal: 30, max: 36)
-
-                    TableColumn("ID") { b in TextField("", text: b.id) }
-                        .width(min: 110, ideal: 140)
-
-                    TableColumn("Name") { b in TextField("", text: b.name) }
-                        .width(min: 100, ideal: 130)
-
-                    TableColumn("Harness") { b in
-                        Picker("", selection: b.harness) {
-                            ForEach(draft.harnesses) { h in
-                                Text(h.name).tag(h.id)
-                            }
-                        }
-                        .labelsHidden()
-                    }
-                    .width(min: 90, ideal: 110)
-
-                    TableColumn("Intell.") { b in
-                        HStack(spacing: 4) {
-                            Slider(value: Binding(get: { Double(b.wrappedValue.intelligence) }, set: { b.wrappedValue.intelligence = Int($0) }), in: 0...100)
-                            Text("\(b.wrappedValue.intelligence)")
-                                .monospacedDigit()
-                                .frame(width: 28, alignment: .trailing)
-                        }
-                    }
-                    .width(min: 95, ideal: 120)
-
-                    TableColumn("Effort") { b in
-                        TextField("Optional", text: Binding(get: { b.wrappedValue.effort ?? "" }, set: { b.wrappedValue.effort = $0.isEmpty ? nil : $0 }))
-                    }
-                    .width(min: 65, ideal: 80)
-
-                    TableColumn("Toggles") { b in
-                        HStack(spacing: 8) {
-                            Toggle("Main", isOn: Binding(
-                                get: { b.wrappedValue.isMain },
-                                set: { newValue in
-                                    b.wrappedValue.isMain = newValue
-                                    if newValue {
-                                        if !(self.draft?.mainOrder.contains(b.wrappedValue.id) ?? false) {
-                                            self.draft?.mainOrder.append(b.wrappedValue.id)
-                                        }
-                                    } else {
-                                        self.draft?.mainOrder.removeAll { $0 == b.wrappedValue.id }
-                                    }
-                                }
-                            ))
-                            .help("Main can lead sessions and receive handoffs")
-
-                            Toggle("Worker", isOn: b.isWorker)
-                                .help("Worker can run delegated jobs")
-
-                            Toggle("Free", isOn: b.free)
-                                .help("Free has no paid model cost")
-
-                            Toggle("Enabled", isOn: b.enabled)
-                                .help("Enabled lets the hub use the model")
-                        }
-                    }
-                    .width(min: 240, ideal: 270)
-                }
+                ModelsTable(draft: Binding(get: { self.draft ?? draft }, set: { self.draft = $0 }), modelToDelete: $modelToDelete)
                 
                 Divider()
                 
@@ -110,7 +38,10 @@ struct ModelsView: View {
                     Button {
                         let newId = "new-\(UUID().uuidString.prefix(4).lowercased())"
                         let harness = draft.harnesses.first?.id ?? "claude"
-                        self.draft?.models.append(ModelEntry(id: newId, harness: harness, name: "New Model", intelligence: 50, isMain: false, isWorker: true))
+                        if var current = self.draft {
+                            ConfigStore.upsertModel(ModelEntry(id: newId, harness: harness, name: "New Model", intelligence: 50, isMain: false, isWorker: true), in: &current)
+                            self.draft = current
+                        }
                     } label: {
                         Label("Add Model", systemImage: "plus")
                     }
@@ -152,7 +83,7 @@ struct ModelsView: View {
         ) { target in
             Button("Delete '\(target.id)'", role: .destructive) {
                 if var currentDraft = draft {
-                    ConfigStore.removeModel(id: target.id, from: &currentDraft)
+                    ConfigStore.removeModel(id: target.id, harness: target.harness, from: &currentDraft)
                     draft = currentDraft
                 }
                 modelToDelete = nil
@@ -166,6 +97,139 @@ struct ModelsView: View {
         .sheet(isPresented: $isAddingMain) {
             AddMainModelSheet(draft: Binding(get: { draft ?? engine.config }, set: { draft = $0 }), isPresented: $isAddingMain)
         }
+    }
+}
+
+private struct ModelsTable: View {
+    @Binding var draft: AppConfig
+    @Binding var modelToDelete: ModelEntry?
+
+    /// Rows keyed by harness/id: the same model id may exist in two harnesses.
+    struct ModelRow: Identifiable { let id: String; let index: Int }
+    private var rows: [ModelRow] { draft.models.indices.map { ModelRow(id: draft.models[$0].qualifiedID, index: $0) } }
+
+    var body: some View {
+        Table(rows) {
+            deleteColumn
+            idColumn
+            nameColumn
+            harnessColumn
+            intelligenceColumn
+            effortColumn
+            togglesColumn
+            brokerColumn
+        }
+    }
+
+    private var deleteColumn: some TableColumnContent<ModelRow, Never> {
+        TableColumn("") { row in let model = $draft.models[row.index];
+            Button(role: .destructive) {
+                modelToDelete = model.wrappedValue
+            } label: {
+                Image(systemName: "trash")
+                    .foregroundColor(.red)
+            }
+            .buttonStyle(.plain)
+            .help("Delete model")
+        }
+        .width(min: 28, ideal: 30, max: 36)
+    }
+
+    private var idColumn: some TableColumnContent<ModelRow, Never> {
+        TableColumn("ID") { row in let model = $draft.models[row.index]; TextField("", text: model.id) }
+            .width(min: 110, ideal: 140)
+    }
+
+    private var nameColumn: some TableColumnContent<ModelRow, Never> {
+        TableColumn("Name") { row in let model = $draft.models[row.index]; TextField("", text: model.name) }
+            .width(min: 100, ideal: 130)
+    }
+
+    private var harnessColumn: some TableColumnContent<ModelRow, Never> {
+        TableColumn("Harness") { row in let model = $draft.models[row.index];
+            Picker("", selection: model.harness) {
+                ForEach(draft.harnesses) { harness in
+                    Text(harness.name).tag(harness.id)
+                }
+            }
+            .labelsHidden()
+        }
+        .width(min: 90, ideal: 110)
+    }
+
+    private var intelligenceColumn: some TableColumnContent<ModelRow, Never> {
+        TableColumn("Intell.") { row in let model = $draft.models[row.index];
+            HStack(spacing: 4) {
+                Slider(value: Binding(
+                    get: { Double(model.wrappedValue.intelligence) },
+                    set: { model.wrappedValue.intelligence = Int($0) }
+                ), in: 0...100)
+                Text("\(model.wrappedValue.intelligence)")
+                    .monospacedDigit()
+                    .frame(width: 28, alignment: .trailing)
+            }
+        }
+        .width(min: 95, ideal: 120)
+    }
+
+    private var effortColumn: some TableColumnContent<ModelRow, Never> {
+        TableColumn("Effort") { row in let model = $draft.models[row.index];
+            TextField("Optional", text: Binding(
+                get: { model.wrappedValue.effort ?? "" },
+                set: { model.wrappedValue.effort = $0.isEmpty ? nil : $0 }
+            ))
+        }
+        .width(min: 65, ideal: 80)
+    }
+
+    private var togglesColumn: some TableColumnContent<ModelRow, Never> {
+        TableColumn("Toggles") { row in let model = $draft.models[row.index];
+            HStack(spacing: 8) {
+                Toggle("Main", isOn: Binding(
+                    get: { model.wrappedValue.isMain },
+                    set: { newValue in
+                        model.wrappedValue.isMain = newValue
+                        if newValue {
+                            if !draft.mainOrder.contains(model.wrappedValue.qualifiedID) {
+                                draft.mainOrder.append(model.wrappedValue.qualifiedID)
+                            }
+                        } else {
+                            draft.mainOrder.removeAll { $0 == model.wrappedValue.qualifiedID }
+                        }
+                    }
+                ))
+                .help("Main can lead sessions and receive handoffs")
+
+                Toggle("Worker", isOn: model.isWorker)
+                    .help("Worker can run delegated jobs")
+
+                Toggle("Free", isOn: model.free)
+                    .help("Free has no paid model cost")
+
+                Toggle("Enabled", isOn: model.enabled)
+                    .help("Enabled lets the hub use the model")
+            }
+        }
+        .width(min: 240, ideal: 270)
+    }
+
+    private var brokerColumn: some TableColumnContent<ModelRow, Never> {
+        TableColumn("Broker") { row in let model = $draft.models[row.index];
+            Toggle("", isOn: Binding(
+                get: {
+                    model.wrappedValue.brokerEligible ??
+                        (model.wrappedValue.isWorker &&
+                         model.wrappedValue.intelligence >= draft.limits.brokerMinIntelligence &&
+                         model.wrappedValue.intelligence <= draft.limits.brokerMaxIntelligence)
+                },
+                set: { model.wrappedValue.brokerEligible = $0 }
+            ))
+            .labelsHidden()
+            .accessibilityLabel("Broker eligible")
+            .disabled(!model.wrappedValue.enabled || !model.wrappedValue.isWorker || draft.harness(model.wrappedValue.harness)?.trusted != true)
+            .help("Allow this enabled, trusted worker model to mask and decode project jobs")
+        }
+        .width(min: 55, ideal: 65)
     }
 }
 

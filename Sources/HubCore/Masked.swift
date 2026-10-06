@@ -127,7 +127,7 @@ public enum Masked {
         Write into \(maskDir):
         - brief.md: a self-contained generic task describing exactly the work to do, where every project name, product, person, company, path, URL, email, key and domain identifier is replaced by neutral placeholders (P1, P2...). Include the expected behaviour precisely enough to implement it without the project.
         - files/<flat basename>: masked copies of only the files the worker needs to read or edit (same placeholders). No subfolders.
-        - map.json: {"placeholders":{"P1":"original"},"files":{"basename":"real relative path"}}
+        - map.json: {"placeholders":{"P1":"original"},"classes":{"P1":"name|path|url|email|domain|key|identifier"},"files":{"basename":"real relative path"}}
         - check.json: a JSON argv array run inside files/ that verifies the generic work without the project (for example ["sh","check.sh"] with check.sh in files/, or ["python3","test_x.py"]). It must not need network or anything outside files/.
         Do not copy secrets, credentials or personal data. Do not edit the project.
         """
@@ -138,7 +138,7 @@ public enum Masked {
         \(brief)
 
         Files in the current directory you may read and edit: \(files.joined(separator: ", ")).
-        Edit only those files. You cannot run shell commands; a check runs after you finish.
+        Edit only those files. You may run shell commands (for example the tests) in the current directory only; a check runs after you finish.
         """
     }
 
@@ -154,5 +154,24 @@ public enum Masked {
         Then run the acceptance argv and make it pass: \(job.checkArgv.joined(separator: " "))
         Do not commit.
         """
+    }
+
+    static let maskClasses: Set<String> = ["name", "path", "url", "email", "domain", "key", "identifier"]
+
+    /// The classes of values the broker masked: its own labels when valid, else classified from the originals.
+    public static func classes(placeholders: [String: String], labels: [String: String]?) -> [String] {
+        var found = Set<String>()
+        for (p, original) in placeholders {
+            if let l = labels?[p]?.lowercased(), maskClasses.contains(l) { found.insert(l); continue }
+            let v = original.trimmingCharacters(in: .whitespaces)
+            if Secrets.contains(v) { found.insert("key") }
+            else if v.contains("://") { found.insert("url") }
+            else if v.contains("@") && v.contains(".") { found.insert("email") }
+            else if v.contains("/") || v.hasPrefix("~") { found.insert("path") }
+            else if v.range(of: #"^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)+$"#, options: .regularExpression) != nil && !v.contains(" ") { found.insert("domain") }
+            else if v.contains(" ") || v.first?.isUppercase == true { found.insert("name") }
+            else { found.insert("identifier") }
+        }
+        return found.sorted()
     }
 }

@@ -69,74 +69,7 @@ public struct UsageMeter {
             guard !data.isEmpty else { continue }
             let text = String(decoding: data, as: UTF8.self)
 
-            // Newest occurrence that is an object (some events carry "rate_limits": null).
-            var searchEnd = text.endIndex
-            var found: String.Index? = nil
-            while found == nil, let rlRange = text.range(of: "\"rate_limits\"", options: .backwards, range: text.startIndex..<searchEnd) {
-                searchEnd = rlRange.lowerBound
-                let rest = text[rlRange.upperBound...].drop { $0 == " " || $0 == "\t" }
-                guard rest.first == ":" else { continue }
-                let value = rest.dropFirst().drop { $0 == " " || $0 == "\t" || $0 == "\n" }
-                if value.first == "{" { found = value.startIndex }
-            }
-            guard let openBraceIdx = found else { continue }
-
-            var depth = 0
-            var inString = false
-            var isEscaped = false
-            var closeBraceIdx: String.Index? = nil
-
-            for idx in text.indices[openBraceIdx...] {
-                let ch = text[idx]
-                if inString {
-                    if isEscaped {
-                        isEscaped = false
-                    } else if ch == "\\" {
-                        isEscaped = true
-                    } else if ch == "\"" {
-                        inString = false
-                    }
-                } else {
-                    if ch == "\"" {
-                        inString = true
-                    } else if ch == "{" {
-                        depth += 1
-                    } else if ch == "}" {
-                        depth -= 1
-                        if depth == 0 {
-                            closeBraceIdx = idx
-                            break
-                        }
-                    }
-                }
-            }
-
-            guard let closeBraceIdx else { continue }
-            let jsonSub = String(text[openBraceIdx...closeBraceIdx])
-            guard let jsonData = jsonSub.data(using: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] else {
-                continue
-            }
-
-            var windows: [UsageWindow] = []
-            if let primary = obj["primary"] as? [String: Any] {
-                var used = (primary["used_percent"] as? NSNumber)?.doubleValue ?? 0.0
-                let resetsAt = (primary["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
-                if let resetsAt, resetsAt <= now {
-                    used = 0.0
-                }
-                windows.append(UsageWindow(name: "5h", usedPercent: used, resetsAt: resetsAt))
-            }
-            if let secondary = obj["secondary"] as? [String: Any] {
-                var used = (secondary["used_percent"] as? NSNumber)?.doubleValue ?? 0.0
-                let resetsAt = (secondary["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
-                if let resetsAt, resetsAt <= now {
-                    used = 0.0
-                }
-                windows.append(UsageWindow(name: "7d", usedPercent: used, resetsAt: resetsAt))
-            }
-
-            guard !windows.isEmpty else { continue }
+            guard let windows = Self.newestCodexWindows(in: text, now: now) else { continue }
 
             let minRemaining = windows.map { 1.0 - ($0.usedPercent / 100.0) }.min() ?? 1.0
             let left = Self.round3(minRemaining)
@@ -144,6 +77,51 @@ public struct UsageMeter {
         }
 
         return UsageReading(left: nil, windows: [], source: "codexSessions", asOf: nil)
+    }
+
+    /// Newest `"rate_limits"` object in `text` that carries a usage window. Codex interleaves
+    /// per-limit records (e.g. `"limit_id":"premium"` with null windows) with the real `codex`
+    /// record, so null-window and `null` occurrences are skipped instead of ending the file.
+    static func newestCodexWindows(in text: String, now: Date) -> [UsageWindow]? {
+        var searchEnd = text.endIndex
+        while let rlRange = text.range(of: "\"rate_limits\"", options: .backwards, range: text.startIndex..<searchEnd) {
+            searchEnd = rlRange.lowerBound
+            let rest = text[rlRange.upperBound...].drop { $0 == " " || $0 == "\t" }
+            guard rest.first == ":" else { continue }
+            let value = rest.dropFirst().drop { $0 == " " || $0 == "\t" || $0 == "\n" }
+            guard value.first == "{", let close = matchingBrace(in: text, from: value.startIndex),
+                  let data = String(text[value.startIndex...close]).data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
+            if let id = obj["limit_id"] as? String, id != "codex" { continue }
+            var windows: [UsageWindow] = []
+            for (key, name) in [("primary", "5h"), ("secondary", "7d")] {
+                guard let w = obj[key] as? [String: Any] else { continue }
+                var used = (w["used_percent"] as? NSNumber)?.doubleValue ?? 0.0
+                let resetsAt = (w["resets_at"] as? NSNumber).map { Date(timeIntervalSince1970: $0.doubleValue) }
+                if let resetsAt, resetsAt <= now { used = 0.0 }
+                windows.append(UsageWindow(name: name, usedPercent: used, resetsAt: resetsAt))
+            }
+            if !windows.isEmpty { return windows }
+        }
+        return nil
+    }
+
+    private static func matchingBrace(in text: String, from open: String.Index) -> String.Index? {
+        var depth = 0, inString = false, isEscaped = false
+        for idx in text.indices[open...] {
+            let ch = text[idx]
+            if inString {
+                if isEscaped { isEscaped = false } else if ch == "\\" { isEscaped = true } else if ch == "\"" { inString = false }
+            } else if ch == "\"" {
+                inString = true
+            } else if ch == "{" {
+                depth += 1
+            } else if ch == "}" {
+                depth -= 1
+                if depth == 0 { return idx }
+            }
+        }
+        return nil
     }
 
     private func readClaudeStatusline(now: Date) -> UsageReading {
@@ -260,6 +238,11 @@ public enum Cooldowns {
             }
             return map[key]
         }
+    }
+
+    /// All cooldowns still in force.
+    public static func active(paths: HubPaths, now: Date) -> [String: Date] {
+        (FileStore.read([String: Date].self, from: paths.cooldowns) ?? [:]).filter { $0.value > now }
     }
 
     public static func until(key: String, paths: HubPaths, now: Date) -> Date? {
