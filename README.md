@@ -186,3 +186,18 @@ Events are appended to `~/Library/Application Support/AgentHub/logs/events.jsonl
 (or `$AGENT_HUB_HOME/logs/events.jsonl`). Run `agenthubctl monitor --follow` to
 watch live events and `agenthubctl stats` for counts and timings. Both support
 `--json`. The app's Activity tab shows the live log, filters and summary stats.
+
+## Status and known limitations
+
+- Personal tool, built for one developer's multi-harness workflow; expect rough edges outside that setup.
+- The app is unsandboxed and ad-hoc signed by default, so macOS Gatekeeper asks you to approve the first launch.
+- Usage meters depend on each harness's own hooks or status line; without them a harness is shown as "usage unknown".
+- Model names and intelligence scores in the default config are editable placeholders, not benchmarks.
+
+## Contributing
+
+Issues and pull requests are welcome. Run `sh scripts/test.sh` before sending a change.
+
+## Licence
+
+[MIT](LICENSE) © 2026 Satya Siddhartha Balanagu.
